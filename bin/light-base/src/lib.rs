@@ -164,6 +164,12 @@ pub struct AddChainConfig<'a, TChain, TRelays> {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChainId(usize);
 
+impl From<usize> for ChainId {
+    fn from(id: usize) -> ChainId {
+        ChainId(id)
+    }
+}
+
 /// Holds a list of chains, connections, and JSON-RPC services.
 pub struct Client<TPlat: platform::Platform, TChain = ()> {
     /// Tasks can be spawned by calling this function. The first parameter is the name of the task
