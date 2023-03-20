@@ -1,0 +1,1157 @@
+// Smoldot
+// Copyright (C) 2019-2022  Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Smoldot light client library.
+//!
+//! This library provides an easy way to create a light client.
+//!
+//! This light client is opinionated towards certain aspects: what it downloads, how much memory
+//! and CPU it is willing to consume, etc.
+//!
+//! # Usage
+//!
+//! ## Initialization
+//!
+//! In order to use the light client, call [`Client::new`], passing a [`ClientConfig`]. See the
+//! documentation of [`ClientConfig`] for information about what to provide.
+//!
+//! The [`Client`] contains two generic parameters:
+//!
+//! - An implementation of the [`platform::Platform`] trait. This is how the client will
+//! communicate with the outside, such as getting the current time.
+//! - An opaque user data. If you do not use this, you can simply use `()`.
+//!
+//! ## Adding a chain
+//!
+//! After the client has been initialized, use [`Client::add_chain`] to ask the client to connect
+//! to said chain. See the documentation of [`AddChainConfig`] for information about what to
+//! provide.
+//!
+//! [`Client::add_chain`] returns a [`ChainId`], which identifies the chain within the [`Client`].
+//! A [`Client`] can be thought of as a collection of chain connections, each identified by their
+//! [`ChainId`], akin to a `HashMap<ChainId, ...>`.
+//!
+//! A chain can be removed at any time using [`Client::remove_chain`]. This will cause the client
+//! to stop all connections and clean up its internal services. The [`ChainId`] is instantly
+//! considered as invalid as soon as the method is called.
+//!
+//! ## JSON-RPC requests and responses
+//!
+//! Once a chain has been added, one can send JSON-RPC requests using [`Client::json_rpc_request`].
+//!
+//! The request parameter of this function must be a JSON-RPC request in its text form. For
+//! example: `{"id":53,"jsonrpc":"2.0","method":"system_name","params":[]}`.
+//!
+//! Calling [`Client::json_rpc_request`] queues the request in the internals of the client. Later,
+//! the client will process it.
+//!
+//! Responses can be pulled by calling the [`AddChainSuccess::json_rpc_responses`] that is returned
+//! after a chain has been added.
+//!
+// TODO: talk about the fact that a randomness environment is assumed?
+
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+#![recursion_limit = "512"]
+#![deny(rustdoc::broken_intra_doc_links)]
+// TODO: the `unused_crate_dependencies` lint is disabled because of dev-dependencies, see <https://github.com/rust-lang/rust/issues/95513>
+// #![deny(unused_crate_dependencies)]
+
+extern crate alloc;
+
+use alloc::{borrow::ToOwned as _, boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
+use core::{num::NonZeroU32, pin::Pin};
+use futures::{channel::oneshot, prelude::*};
+use hashbrown::{hash_map::Entry, HashMap};
+use itertools::Itertools as _;
+use smoldot::{
+    chain::{self, chain_information},
+    chain_spec, header,
+    informant::HashDisplay,
+    libp2p::{connection, multiaddr, peer_id},
+};
+
+mod database;
+mod json_rpc_service;
+mod network_service;
+mod runtime_service;
+mod sync_service;
+mod transactions_service;
+mod util;
+
+pub mod platform;
+
+pub use json_rpc_service::HandleRpcError;
+pub use peer_id::PeerId;
+
+/// Configuration for a client.
+///
+/// See [`Client::new`].
+pub struct ClientConfig {
+    /// In order for the client to function, it needs to be able to spawn tasks in the background
+    /// that will run indefinitely. To do so, it will call this function with the task to spawn.
+    /// The first parameter is the name of the task, which can be useful for debugging purposes.
+    pub tasks_spawner: Box<dyn Fn(String, future::BoxFuture<'static, ()>) + Send + Sync>,
+
+    /// Value returned when a JSON-RPC client requests the name of the client. Reasonable value
+    /// is `env!("CARGO_PKG_NAME")`.
+    pub system_name: String,
+
+    /// Value returned when a JSON-RPC client requests the version of the client. Reasonable value
+    /// is `env!("CARGO_PKG_VERSION")`.
+    pub system_version: String,
+}
+
+/// See [`Client::add_chain`].
+#[derive(Debug, Clone)]
+pub struct AddChainConfig<'a, TChain, TRelays> {
+    /// Opaque user data that the [`Client`] will hold for this chain.
+    pub user_data: TChain,
+
+    /// JSON text containing the specification of the chain (the so-called "chain spec").
+    pub specification: &'a str,
+
+    /// Opaque data containing the database content that was retrieved by calling
+    /// the `chainHead_unstable_finalizedDatabase` JSON-RPC function in the past.
+    ///
+    /// Pass an empty string if no database content exists or is known.
+    ///
+    /// No error is generated if this data is invalid and/or can't be decoded. The implementation
+    /// reserves the right to break the format of this data at any point.
+    pub database_content: &'a str,
+
+    /// If [`AddChainConfig`] defines a parachain, contains the list of relay chains to choose
+    /// from. Ignored if not a parachain.
+    ///
+    /// This field is necessary because multiple different chain can have the same identity. If
+    /// the client tried to find the corresponding relay chain in all the previously-spawned
+    /// chains, it means that a call to [`Client::add_chain`] could influence the outcome of a
+    /// subsequent call to [`Client::add_chain`].
+    ///
+    /// For example: if user A adds a chain named "Kusama", then user B adds a different chain
+    /// also named "Kusama", then user B adds a parachain whose relay chain is "Kusama", it would
+    /// be wrong to connect to the "Kusama" created by user A.
+    pub potential_relay_chains: TRelays,
+
+    /// If `false`, then no JSON-RPC service is started for this chain. This saves up a lot of
+    /// resources, but will cause all JSON-RPC requests targeting this chain to fail.
+    pub disable_json_rpc: bool,
+}
+
+/// Chain registered in a [`Client`].
+//
+// Implementation detail: corresponds to indices within [`Client::public_api_chains`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChainId(usize);
+
+impl From<usize> for ChainId {
+    fn from(id: usize) -> ChainId {
+        ChainId(id)
+    }
+}
+
+/// Holds a list of chains, connections, and JSON-RPC services.
+pub struct Client<TPlat: platform::Platform, TChain = ()> {
+    /// Tasks can be spawned by calling this function. The first parameter is the name of the task
+    /// used for debugging purposes.
+    spawn_new_task: Arc<dyn Fn(String, future::BoxFuture<'static, ()>) + Send + Sync>,
+
+    /// List of chains currently running according to the public API. Indices in this container
+    /// are reported through the public API. The values are either an error if the chain has failed
+    /// to initialize, or key found in [`Client::chains_by_key`].
+    public_api_chains: slab::Slab<PublicApiChain<TChain>>,
+
+    /// De-duplicated list of chains that are *actually* running.
+    ///
+    /// For each key, contains the services running for this chain plus the number of public API
+    /// chains that correspond to it.
+    ///
+    /// The [`ChainServices`] is within a `MaybeDone`. The variant will be `MaybeDone::Future` if
+    /// initialization is still in progress.
+    // TODO: use SipHasher
+    chains_by_key: HashMap<ChainKey, RunningChain<TPlat>, fnv::FnvBuildHasher>,
+
+    /// Value to return when the `system_name` RPC is called. Should be set to the name of the
+    /// final executable.
+    system_name: String,
+
+    /// Value to return when the `system_version` RPC is called. Should be set to the version of
+    /// the final executable.
+    system_version: String,
+}
+
+struct PublicApiChain<TChain> {
+    /// Opaque user data passed to [`Client::add_chain`].
+    user_data: TChain,
+
+    /// Index of the underlying chain found in [`Client::chains_by_key`].
+    key: ChainKey,
+
+    /// Identifier of the chain found in its chain spec. Equal to the return value of
+    /// [`chain_spec::ChainSpec::id`]. Used in order to match parachains with relay chains.
+    chain_spec_chain_id: String,
+
+    /// Handle that sends requests to the JSON-RPC service that runs in the background.
+    /// Destroying this handle also shuts down the service. `None` iff
+    /// [`AddChainConfig::disable_json_rpc`] was `true` when adding the chain.
+    json_rpc_frontend: Option<json_rpc_service::Frontend>,
+
+    /// Dummy channel. Nothing is ever sent on it, but the receiving side is stored in the
+    /// [`JsonRpcResponses`] in order to detect when the chain has been removed.
+    _public_api_chain_destroyed_tx: oneshot::Sender<()>,
+}
+
+/// Identifies a chain, so that multiple identical chains are de-duplicated.
+///
+/// This struct serves as the key in a `HashMap<ChainKey, ChainServices>`. It must contain all the
+/// values that are important to the logic of the fields that are contained in [`ChainServices`].
+/// Failing to include a field in this struct could lead to two different chains using the same
+/// [`ChainServices`], which has security consequences.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChainKey {
+    /// Hash of the genesis block of the chain.
+    genesis_block_hash: [u8; 32],
+
+    // TODO: what about light checkpoints?
+    // TODO: must also contain forkBlocks, and badBlocks fields
+    /// If the chain is a parachain, contains the relay chain and the "para ID" on this relay
+    /// chain.
+    relay_chain: Option<(Box<ChainKey>, u32)>,
+
+    /// Networking fork id, found in the chain specification.
+    fork_id: Option<String>,
+}
+
+struct RunningChain<TPlat: platform::Platform> {
+    /// Services that are dedicated to this chain. Wrapped within a `MaybeDone` because the
+    /// initialization is performed asynchronously.
+    services: future::MaybeDone<future::Shared<future::RemoteHandle<ChainServices<TPlat>>>>,
+
+    /// Name of this chain in the logs. This is not necessarily the same as the identifier of the
+    /// chain in its chain specification.
+    log_name: String,
+
+    /// Number of elements in [`Client::public_api_chains`] that reference this chain. If this
+    /// number reaches `0`, the [`RunningChain`] should be destroyed.
+    num_references: NonZeroU32,
+}
+
+struct ChainServices<TPlat: platform::Platform> {
+    network_service: Arc<network_service::NetworkService<TPlat>>,
+    network_identity: peer_id::PeerId,
+    sync_service: Arc<sync_service::SyncService<TPlat>>,
+    runtime_service: Arc<runtime_service::RuntimeService<TPlat>>,
+    transactions_service: Arc<transactions_service::TransactionsService<TPlat>>,
+    // TODO: can be grabbed from the sync service instead
+    block_number_bytes: usize,
+}
+
+impl<TPlat: platform::Platform> Clone for ChainServices<TPlat> {
+    fn clone(&self) -> Self {
+        ChainServices {
+            network_service: self.network_service.clone(),
+            network_identity: self.network_identity.clone(),
+            sync_service: self.sync_service.clone(),
+            runtime_service: self.runtime_service.clone(),
+            transactions_service: self.transactions_service.clone(),
+            block_number_bytes: self.block_number_bytes,
+        }
+    }
+}
+
+/// Returns by [`Client::add_chain`] on success.
+pub struct AddChainSuccess {
+    /// Newly-allocated identifier for the chain.
+    pub chain_id: ChainId,
+
+    /// Stream of JSON-RPC responses or notifications.
+    ///
+    /// Is always `Some` if [`AddChainConfig::disable_json_rpc`] was `false`, and `None` if it was
+    /// `true`. In other words, you can unwrap this `Option` if you passed `false`.
+    pub json_rpc_responses: Option<JsonRpcResponses>,
+}
+
+/// Stream of JSON-RPC responses or notifications.
+///
+/// See [`AddChainSuccess::json_rpc_responses`].
+pub struct JsonRpcResponses {
+    /// Receiving side for responses.
+    ///
+    /// As long as this object is alive, the JSON-RPC service will continue running. In order
+    /// to prevent that from happening, we destroy it as soon as the
+    /// [`JsonRpcResponses::public_api_chain_destroyed_rx`] is notified of the destruction of
+    /// the sender.
+    inner: Option<json_rpc_service::Frontend>,
+
+    /// Dummy channel. Nothing is ever sent on it, but the sending side is stored in the
+    /// [`PublicApiChain`] in order to detect when the chain has been removed.
+    public_api_chain_destroyed_rx: oneshot::Receiver<()>,
+}
+
+impl JsonRpcResponses {
+    /// Returns the next response or notification, or `None` if the chain has been removed.
+    pub async fn next(&mut self) -> Option<String> {
+        if let Some(frontend) = self.inner.as_mut() {
+            let response_fut = frontend.next_json_rpc_response();
+            futures::pin_mut!(response_fut);
+            match future::select(response_fut, &mut self.public_api_chain_destroyed_rx).await {
+                future::Either::Left((response, _)) => return Some(response),
+                future::Either::Right((_result, _)) => {
+                    debug_assert!(_result.is_err());
+                }
+            }
+        }
+
+        self.inner = None;
+        None
+    }
+}
+
+impl<TPlat: platform::Platform, TChain> Client<TPlat, TChain> {
+    /// Initializes the smoldot client.
+    pub fn new(config: ClientConfig) -> Self {
+        let expected_chains = 8;
+        Client {
+            spawn_new_task: config.tasks_spawner.into(),
+            public_api_chains: slab::Slab::with_capacity(expected_chains),
+            chains_by_key: HashMap::with_capacity_and_hasher(expected_chains, Default::default()),
+            system_name: config.system_name,
+            system_version: config.system_version,
+        }
+    }
+
+    /// Adds a new chain to the list of chains smoldot tries to synchronize.
+    ///
+    /// Returns an error in case something is wrong with the configuration.
+    pub fn add_chain(
+        &mut self,
+        config: AddChainConfig<'_, TChain, impl Iterator<Item = ChainId>>,
+    ) -> Result<AddChainSuccess, AddChainError> {
+        // Decode the chain specification.
+        let chain_spec = match chain_spec::ChainSpec::from_json_bytes(config.specification) {
+            Ok(cs) => cs,
+            Err(err) => {
+                return Err(AddChainError::ChainSpecParseError(err));
+            }
+        };
+
+        // Load the information about the chain from the chain spec. If a light sync state (also
+        // known as a checkpoint) is present in the chain spec, it is possible to start syncing at
+        // the finalized block it describes.
+        // TODO: clean up that block
+        let (chain_information, genesis_block_header, checkpoint_nodes) = {
+            match (
+                chain_spec.as_chain_information().map(|(ci, _)| ci), // TODO: don't just throw away the runtime
+                chain_spec.light_sync_state().map(|s| {
+                    chain::chain_information::ValidChainInformation::try_from(
+                        s.as_chain_information(),
+                    )
+                }),
+                database::decode_database(
+                    config.database_content,
+                    chain_spec.block_number_bytes().into(),
+                ),
+            ) {
+                // Use the database if it contains a more recent block than the chain spec checkpoint.
+                (Ok(genesis_ci), checkpoint, Ok(database_content))
+                    if database_content.genesis_block_hash
+                        == genesis_ci
+                            .as_ref()
+                            .finalized_block_header
+                            .hash(chain_spec.block_number_bytes().into())
+                        && checkpoint.as_ref().and_then(|r| r.as_ref().ok()).map_or(
+                            true,
+                            |cp| {
+                                cp.as_ref().finalized_block_header.number
+                                    < database_content
+                                        .chain_information
+                                        .as_ref()
+                                        .finalized_block_header
+                                        .number
+                            },
+                        ) =>
+                {
+                    let genesis_header = genesis_ci.as_ref().finalized_block_header.clone();
+                    (
+                        database_content.chain_information,
+                        genesis_header.into(),
+                        database_content.known_nodes,
+                    )
+                }
+
+                // Use the database if it contains a more recent block than the chain spec checkpoint.
+                (
+                    Err(chain_spec::FromGenesisStorageError::UnknownStorageItems),
+                    checkpoint,
+                    Ok(database_content),
+                ) if checkpoint
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map_or(true, |cp| {
+                        cp.as_ref().finalized_block_header.number
+                            < database_content
+                                .chain_information
+                                .as_ref()
+                                .finalized_block_header
+                                .number
+                    }) =>
+                {
+                    let genesis_header = header::Header {
+                        parent_hash: [0; 32],
+                        number: 0,
+                        state_root: *chain_spec.genesis_storage().into_trie_root_hash().unwrap(),
+                        extrinsics_root: smoldot::trie::empty_trie_merkle_value(),
+                        digest: header::DigestRef::empty().into(),
+                    };
+
+                    if database_content.genesis_block_hash
+                        == genesis_header.hash(chain_spec.block_number_bytes().into())
+                    {
+                        (
+                            database_content.chain_information,
+                            genesis_header,
+                            database_content.known_nodes,
+                        )
+                    } else if let Some(Ok(checkpoint)) = checkpoint {
+                        // Database is incorrect.
+                        (checkpoint, genesis_header, database_content.known_nodes)
+                    } else {
+                        // TODO: we can in theory support chain specs that have neither a checkpoint nor the genesis storage, but it's complicated
+                        // TODO: is this relevant for parachains?
+                        return Err(AddChainError::ChainSpecNeitherGenesisStorageNorCheckpoint);
+                    }
+                }
+
+                (Err(chain_spec::FromGenesisStorageError::UnknownStorageItems), None, _) => {
+                    // TODO: we can in theory support chain specs that have neither a checkpoint nor the genesis storage, but it's complicated
+                    // TODO: is this relevant for parachains?
+                    return Err(AddChainError::ChainSpecNeitherGenesisStorageNorCheckpoint);
+                }
+
+                (
+                    Err(chain_spec::FromGenesisStorageError::UnknownStorageItems),
+                    Some(Ok(checkpoint)),
+                    _,
+                ) => {
+                    let genesis_header = header::Header {
+                        parent_hash: [0; 32],
+                        number: 0,
+                        state_root: *chain_spec.genesis_storage().into_trie_root_hash().unwrap(),
+                        extrinsics_root: smoldot::trie::empty_trie_merkle_value(),
+                        digest: header::DigestRef::empty().into(),
+                    };
+
+                    (checkpoint, genesis_header, Default::default())
+                }
+
+                (Err(err), _, _) => return Err(AddChainError::InvalidGenesisStorage(err)),
+
+                (_, Some(Err(err)), _) => {
+                    return Err(AddChainError::InvalidCheckpoint(err));
+                }
+
+                (Ok(genesis_ci), Some(Ok(checkpoint)), _) => {
+                    let genesis_header = genesis_ci.as_ref().finalized_block_header.clone();
+                    (checkpoint, genesis_header.into(), Default::default())
+                }
+
+                (Ok(genesis_ci), None, _) => {
+                    let genesis_header =
+                        header::Header::from(genesis_ci.as_ref().finalized_block_header.clone());
+                    (genesis_ci, genesis_header, Default::default())
+                }
+            }
+        };
+
+        // If the chain specification specifies a parachain, find the corresponding relay chain
+        // in the list of potential relay chains passed by the user.
+        // If no relay chain can be found, the chain creation fails. Exactly one matching relay
+        // chain must be found. If there are multiple ones, the creation fails as well.
+        let relay_chain_id = if let Some((relay_chain_id, _para_id)) = chain_spec.relay_chain() {
+            let chain = config
+                .potential_relay_chains
+                .filter(|c| {
+                    self.public_api_chains
+                        .get(c.0)
+                        .map_or(false, |chain| chain.chain_spec_chain_id == relay_chain_id)
+                })
+                .exactly_one();
+
+            match chain {
+                Ok(c) => Some(c),
+                Err(mut iter) => {
+                    // `iter` here is identical to the iterator above before `exactly_one` is
+                    // called. This lets us know what failed.
+                    return Err(if iter.next().is_none() {
+                        AddChainError::NoRelayChainFound
+                    } else {
+                        debug_assert!(iter.next().is_some());
+                        AddChainError::MultipleRelayChains
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build the list of bootstrap nodes ahead of time.
+        // Because the specification of the format of a multiaddress is a bit flexible, it is
+        // not possible to firmly affirm that a multiaddress is invalid. For this reason, we
+        // simply ignore unparsable bootnode addresses rather than returning an error.
+        // A list of invalid bootstrap node addresses is kept in order to print a warning later
+        // in case it is non-empty. This list is sanitized in order to be safely printable as part
+        // of the logs.
+        let (bootstrap_nodes, invalid_bootstrap_nodes_sanitized) = {
+            let mut valid_list = Vec::with_capacity(chain_spec.boot_nodes().len());
+            let mut invalid_list = Vec::with_capacity(0);
+            for node in chain_spec.boot_nodes() {
+                match node {
+                    chain_spec::Bootnode::Parsed { multiaddr, peer_id } => {
+                        if let Ok(multiaddr) = multiaddr.parse::<multiaddr::Multiaddr>() {
+                            let peer_id = peer_id::PeerId::from_bytes(peer_id).unwrap();
+                            valid_list.push((peer_id, vec![multiaddr]));
+                        } else {
+                            invalid_list.push(multiaddr)
+                        }
+                    }
+                    chain_spec::Bootnode::UnrecognizedFormat(unparsed) => invalid_list.push(
+                        unparsed
+                            .chars()
+                            .filter(|c| c.is_ascii())
+                            .collect::<String>(),
+                    ),
+                }
+            }
+            (valid_list, invalid_list)
+        };
+
+        // All the checks are performed above. Adding the chain can't fail anymore at this point.
+
+        // Grab a couple of fields from the chain specification for later, as the chain
+        // specification is consumed below.
+        let chain_spec_chain_id = chain_spec.id().to_owned();
+        let genesis_block_hash = genesis_block_header.hash(chain_spec.block_number_bytes().into());
+        let genesis_block_state_root = genesis_block_header.state_root;
+
+        // The key generated here uniquely identifies this chain within smoldot. Mutiple chains
+        // having the same key will use the same services.
+        //
+        // This struct is extremely important from a security perspective. We want multiple
+        // identical chains to be de-duplicated, but security issues would arise if two chains
+        // were considered identical while they're in reality not identical.
+        let new_chain_key = ChainKey {
+            genesis_block_hash,
+            relay_chain: relay_chain_id.map(|ck| {
+                (
+                    Box::new(self.public_api_chains.get(ck.0).unwrap().key.clone()),
+                    chain_spec.relay_chain().unwrap().1,
+                )
+            }),
+            fork_id: chain_spec.fork_id().map(|f| f.to_owned()),
+        };
+
+        // If the chain we are adding is a parachain, grab the services of the relay chain.
+        //
+        // Since the initialization process of a chain is done asynchronously, it is possible that
+        // the relay chain is still initializing. For this reason, we don't don't simply grab
+        // the relay chain services, but instead a `future::MaybeDone` of a future that yelds the
+        // relay chain services.
+        //
+        // This could in principle be done later on, but doing so raises borrow checker errors.
+        let relay_chain_ready_future: Option<(future::MaybeDone<future::Shared<_>>, String)> =
+            relay_chain_id.map(|relay_chain| {
+                let relay_chain = &self
+                    .chains_by_key
+                    .get(&self.public_api_chains.get(relay_chain.0).unwrap().key)
+                    .unwrap();
+
+                let future = match &relay_chain.services {
+                    future::MaybeDone::Done(d) => future::MaybeDone::Done(d.clone()),
+                    future::MaybeDone::Future(d) => future::MaybeDone::Future(d.clone()),
+                    future::MaybeDone::Gone => unreachable!(),
+                };
+
+                (future, relay_chain.log_name.clone())
+            });
+
+        // Determinate the name under which the chain will be identified in the logs.
+        // Because the chain spec is untrusted input, we must transform the `id` to remove all
+        // weird characters.
+        //
+        // By default, this log name will be equal to chain's `id`. Since it is possible for
+        // multiple different chains to have the same `id`, we need to look into the list of
+        // existing chains and make sure that there's no conflict, in which case the log name
+        // will have the suffix `-1`, or `-2`, or `-3`, and so on.
+        //
+        // This value is ignored if we enter the `Entry::Occupied` block below. Because the
+        // calculation requires accessing the list of existing chains, this block can't be put in
+        // the `Entry::Vacant` block below, even though it would make sense for it to be there.
+        let log_name = {
+            let base = chain_spec
+                .id()
+                .chars()
+                .filter(|c| c.is_ascii_graphic())
+                .collect::<String>();
+            let mut suffix = None;
+
+            loop {
+                let attempt = if let Some(suffix) = suffix {
+                    format!("{base}-{suffix}")
+                } else {
+                    base.clone()
+                };
+
+                if !self.chains_by_key.values().any(|c| *c.log_name == attempt) {
+                    break attempt;
+                }
+
+                match &mut suffix {
+                    Some(v) => *v += 1,
+                    v @ None => *v = Some(1),
+                }
+            }
+        };
+
+        // Start the services of the chain to add, or grab the services if they already exist.
+        let (services_init, log_name) = match self.chains_by_key.entry(new_chain_key.clone()) {
+            Entry::Occupied(mut entry) => {
+                // The chain to add always has a corresponding chain running. Simply grab the
+                // existing services and existing log name.
+                // The `log_name` created above is discarded in favour of the existing log name.
+                entry.get_mut().num_references = entry.get().num_references.checked_add(1).unwrap();
+                let entry = entry.into_mut();
+                (&mut entry.services, &entry.log_name)
+            }
+            Entry::Vacant(entry) => {
+                // Key used by the networking. Represents the identity of the node on the
+                // peer-to-peer network.
+                let network_noise_key = connection::NoiseKey::new(&rand::random());
+
+                // Spawn a background task that initializes the services of the new chain and
+                // yields a `ChainServices`.
+                let running_chain_init_future: future::RemoteHandle<ChainServices<TPlat>> = {
+                    let spawn_new_task = self.spawn_new_task.clone();
+                    let chain_spec = chain_spec.clone(); // TODO: quite expensive
+                    let log_name = log_name.clone();
+
+                    let future = async move {
+                        // Wait until the relay chain has finished initializing, if necessary.
+                        let relay_chain =
+                            if let Some((mut relay_chain_ready_future, relay_chain_log_name)) =
+                                relay_chain_ready_future
+                            {
+                                (&mut relay_chain_ready_future).await;
+                                let running_relay_chain = Pin::new(&mut relay_chain_ready_future)
+                                    .take_output()
+                                    .unwrap();
+                                Some((running_relay_chain, relay_chain_log_name))
+                            } else {
+                                None
+                            };
+
+                        // TODO: avoid cloning here
+                        let chain_name = chain_spec.name().to_owned();
+                        let relay_chain_para_id = chain_spec.relay_chain().map(|(_, id)| id);
+                        let starting_block_number =
+                            chain_information.as_ref().finalized_block_header.number;
+                        let starting_block_hash = chain_information
+                            .as_ref()
+                            .finalized_block_header
+                            .hash(chain_spec.block_number_bytes().into());
+                        let has_bad_blocks = chain_spec.bad_blocks_hashes().count() != 0;
+
+                        let running_chain = start_services(
+                            log_name.clone(),
+                            spawn_new_task,
+                            chain_information,
+                            genesis_block_header
+                                .scale_encoding_vec(chain_spec.block_number_bytes().into()),
+                            chain_spec,
+                            relay_chain.as_ref().map(|(r, _)| r),
+                            network_noise_key,
+                        )
+                        .await;
+
+                        // Note that the chain name is printed through the `Debug` trait (rather
+                        // than `Display`) because it is an untrusted user input.
+                        //
+                        // The state root hash is printed in order to make it easy to put it
+                        // in the chain specification.
+                        if let Some((_, relay_chain_log_name)) = relay_chain.as_ref() {
+                            log::info!(
+                                target: "smoldot",
+                                "Parachain initialization complete for {}. Name: {:?}. Genesis \
+                                hash: {}. State root hash: 0x{}. Network identity: {}. Relay \
+                                chain: {} (id: {})",
+                                log_name,
+                                chain_name,
+                                HashDisplay(&genesis_block_hash),
+                                hex::encode(genesis_block_state_root),
+                                running_chain.network_identity,
+                                relay_chain_log_name,
+                                relay_chain_para_id.unwrap(),
+                            );
+                        } else {
+                            log::info!(
+                                target: "smoldot",
+                                "Chain initialization complete for {}. Name: {:?}. Genesis \
+                                hash: {}. State root hash: 0x{}. Network identity: {}. Chain \
+                                specification or database starting at: {} (#{})",
+                                log_name,
+                                chain_name,
+                                HashDisplay(&genesis_block_hash),
+                                hex::encode(genesis_block_state_root),
+                                running_chain.network_identity,
+                                HashDisplay(&starting_block_hash),
+                                starting_block_number
+                            );
+                        }
+
+                        // TODO: remove after https://github.com/paritytech/smoldot/issues/2584
+                        if has_bad_blocks {
+                            log::warn!(
+                                target: "smoldot",
+                                "Chain specification of {} contains a list of bad blocks. Bad \
+                                blocks are not implemented in the light client. An appropriate \
+                                way to silence this warning is to remove the bad blocks from the \
+                                chain specification, which can safely be done:\n\
+                                - For relay chains: if the chain specification contains a \
+                                checkpoint and that the bad blocks have a block number inferior \
+                                to this checkpoint.\n\
+                                - For parachains: if the bad blocks have a block number inferior \
+                                to the current parachain finalized block.", log_name
+                            );
+                        }
+
+                        running_chain
+                    };
+
+                    let (background_future, output_future) = future.remote_handle();
+                    (self.spawn_new_task)(
+                        "services-initialization".to_owned(),
+                        background_future.boxed(),
+                    );
+                    output_future
+                };
+
+                let entry = entry.insert(RunningChain {
+                    services: future::maybe_done(running_chain_init_future.shared()),
+                    log_name,
+                    num_references: NonZeroU32::new(1).unwrap(),
+                });
+
+                (&mut entry.services, &entry.log_name)
+            }
+        };
+
+        if !invalid_bootstrap_nodes_sanitized.is_empty() {
+            log::warn!(
+                target: "smoldot",
+                "Failed to parse some of the bootnodes of {}. \
+                These bootnodes have been ignored. List: {}",
+                log_name, invalid_bootstrap_nodes_sanitized.join(", ")
+            );
+        }
+
+        // Print a warning if the list of bootnodes is empty, as this is a common mistake.
+        if bootstrap_nodes.is_empty() {
+            // Note the usage of the word "likely", because another chain with the same key might
+            // have been added earlier and contains bootnodes, or we might receive an incoming
+            // substream on a connection normally used for a different chain.
+            log::warn!(
+                target: "smoldot",
+                "Newly-added chain {} has an empty list of bootnodes. Smoldot will likely fail \
+                to connect to its peer-to-peer network.",
+                log_name
+            );
+        }
+
+        // Apart from its services, each chain also has an entry in `public_api_chains`.
+        let public_api_chains_entry = self.public_api_chains.vacant_entry();
+        let new_chain_id = ChainId(public_api_chains_entry.key());
+
+        // Multiple chains can share the same network service, but each specify different
+        // bootstrap nodes and database nodes. In order to resolve this, each chain adds their own
+        // bootnodes and database nodes to the network service after it has been initialized. This
+        // is done by adding a short-lived task that waits for the chain initialization to finish
+        // then adds the nodes.
+        (self.spawn_new_task)("network-service-add-initial-topology".to_owned(), {
+            // Clone `running_chain_init`.
+            let mut running_chain_init = match services_init {
+                future::MaybeDone::Done(d) => future::MaybeDone::Done(d.clone()),
+                future::MaybeDone::Future(d) => future::MaybeDone::Future(d.clone()),
+                future::MaybeDone::Gone => unreachable!(),
+            };
+
+            async move {
+                // Wait for the chain to finish initializing to proceed.
+                (&mut running_chain_init).await;
+                let running_chain = Pin::new(&mut running_chain_init).take_output().unwrap();
+                running_chain
+                    .network_service
+                    .discover(&TPlat::now(), 0, checkpoint_nodes, false)
+                    .await;
+                running_chain
+                    .network_service
+                    .discover(&TPlat::now(), 0, bootstrap_nodes, true)
+                    .await;
+            }
+            .boxed()
+        });
+
+        // JSON-RPC service initialization. This is done every time `add_chain` is called, even
+        // if a similar chain already existed.
+        let json_rpc_frontend = if !config.disable_json_rpc {
+            // Clone `running_chain_init`.
+            let mut running_chain_init = match services_init {
+                future::MaybeDone::Done(d) => future::MaybeDone::Done(d.clone()),
+                future::MaybeDone::Future(d) => future::MaybeDone::Future(d.clone()),
+                future::MaybeDone::Gone => unreachable!(),
+            };
+
+            let (frontend, service_starter) = json_rpc_service::service(json_rpc_service::Config {
+                log_name: log_name.clone(), // TODO: add a way to differentiate multiple different json-rpc services under the same chain
+                max_pending_requests: NonZeroU32::new(128).unwrap(),
+                max_subscriptions: 1024, // Note: the PolkadotJS UI is very heavy in terms of subscriptions.
+            });
+
+            let spawn_new_task = self.spawn_new_task.clone();
+            let system_name = self.system_name.clone();
+            let system_version = self.system_version.clone();
+
+            let init_future = async move {
+                // Wait for the chain to finish initializing before starting the JSON-RPC service.
+                (&mut running_chain_init).await;
+                let running_chain = Pin::new(&mut running_chain_init).take_output().unwrap();
+
+                service_starter.start(json_rpc_service::StartConfig {
+                    tasks_executor: Box::new(move |name, task| spawn_new_task(name, task)),
+                    sync_service: running_chain.sync_service,
+                    network_service: (running_chain.network_service, 0), // TODO: 0?
+                    transactions_service: running_chain.transactions_service,
+                    runtime_service: running_chain.runtime_service,
+                    chain_spec: &chain_spec,
+                    peer_id: &running_chain.network_identity,
+                    system_name,
+                    system_version,
+                    genesis_block_hash,
+                    genesis_block_state_root,
+                    max_parallel_requests: NonZeroU32::new(24).unwrap(),
+                    max_parallel_subscription_updates: NonZeroU32::new(8).unwrap(),
+                })
+            };
+
+            (self.spawn_new_task)("json-rpc-service-init".to_owned(), init_future.boxed());
+
+            Some(frontend)
+        } else {
+            None
+        };
+
+        // Success!
+        let (public_api_chain_destroyed_tx, public_api_chain_destroyed_rx) = oneshot::channel();
+        public_api_chains_entry.insert(PublicApiChain {
+            user_data: config.user_data,
+            key: new_chain_key,
+            chain_spec_chain_id,
+            json_rpc_frontend: json_rpc_frontend.clone(),
+            _public_api_chain_destroyed_tx: public_api_chain_destroyed_tx,
+        });
+        Ok(AddChainSuccess {
+            chain_id: new_chain_id,
+            json_rpc_responses: json_rpc_frontend.map(|f| JsonRpcResponses {
+                inner: Some(f),
+                public_api_chain_destroyed_rx,
+            }),
+        })
+    }
+
+    /// Removes the chain from smoldot. This instantaneously and silently cancels all on-going
+    /// JSON-RPC requests and subscriptions.
+    ///
+    /// The provided [`ChainId`] is now considered dead. Be aware that this same [`ChainId`] might
+    /// later be reused if [`Client::add_chain`] is called again.
+    ///
+    /// While from the API perspective it will look like the chain no longer exists, calling this
+    /// function will not actually immediately disconnect from the given chain if it is still used
+    /// as the relay chain of a parachain.
+    ///
+    /// If the [`JsonRpcResponses`] object that was returned when adding the chain is still alive,
+    /// [`JsonRpcResponses::next`] will now return `None`.
+    #[must_use]
+    pub fn remove_chain(&mut self, id: ChainId) -> TChain {
+        let removed_chain = self.public_api_chains.remove(id.0);
+
+        let running_chain = self.chains_by_key.get_mut(&removed_chain.key).unwrap();
+        if running_chain.num_references.get() == 1 {
+            log::info!(target: "smoldot", "Shutting down chain {}", running_chain.log_name);
+            self.chains_by_key.remove(&removed_chain.key);
+        } else {
+            running_chain.num_references =
+                NonZeroU32::new(running_chain.num_references.get() - 1).unwrap();
+        }
+
+        self.public_api_chains.shrink_to_fit();
+
+        removed_chain.user_data
+    }
+
+    /// Returns the user data associated to the given chain.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the [`ChainId`] is invalid.
+    ///
+    pub fn chain_user_data_mut(&mut self, chain_id: ChainId) -> &mut TChain {
+        &mut self
+            .public_api_chains
+            .get_mut(chain_id.0)
+            .unwrap()
+            .user_data
+    }
+
+    /// Enqueues a JSON-RPC request towards the given chain.
+    ///
+    /// Since most JSON-RPC requests can only be answered asynchronously, the request is only
+    /// queued and will be decoded and processed later.
+    ///
+    /// Returns an error if the node is overloaded and is capable of processing more JSON-RPC
+    /// requests before some time has passed or the [`AddChainSuccess::json_rpc_responses`]
+    /// stream is emptied.
+    ///
+    /// Also returns an error if the request could not be parsed as a valid JSON-RPC request, as
+    /// in that situation smoldot is unable to send back a corresponding JSON-RPC error message.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the [`ChainId`] is invalid, or if [`AddChainConfig::disable_json_rpc`] was
+    /// `true` when adding the chain.
+    ///
+    pub fn json_rpc_request(
+        &mut self,
+        json_rpc_request: impl Into<String>,
+        chain_id: ChainId,
+    ) -> Result<(), HandleRpcError> {
+        self.json_rpc_request_inner(json_rpc_request.into(), chain_id)
+    }
+
+    fn json_rpc_request_inner(
+        &mut self,
+        json_rpc_request: String,
+        chain_id: ChainId,
+    ) -> Result<(), HandleRpcError> {
+        let json_rpc_sender = match self
+            .public_api_chains
+            .get_mut(chain_id.0)
+            .unwrap()
+            .json_rpc_frontend
+        {
+            Some(ref mut json_rpc_sender) => json_rpc_sender,
+            _ => panic!(),
+        };
+
+        json_rpc_sender.queue_rpc_request(json_rpc_request)
+    }
+}
+
+/// Error potentially returned by [`Client::add_chain`].
+#[derive(Debug, derive_more::Display)]
+pub enum AddChainError {
+    /// Failed to decode the specification of the chain.
+    #[display(fmt = "Failed to decode chain specification: {_0}")]
+    ChainSpecParseError(chain_spec::ParseError),
+    /// The chain specification must contain either the storage of the genesis block, or a
+    /// checkpoint. Neither was provided.
+    #[display(fmt = "Either a checkpoint or the genesis storage must be provided")]
+    ChainSpecNeitherGenesisStorageNorCheckpoint,
+    /// Checkpoint provided in the chain specification is invalid.
+    #[display(fmt = "Invalid checkpoint in chain specification: {_0}")]
+    InvalidCheckpoint(chain_information::ValidityError),
+    /// Failed to build the information about the chain from the genesis storage. This indicates
+    /// invalid data in the genesis storage.
+    #[display(fmt = "Failed to build genesis chain information: {_0}")]
+    InvalidGenesisStorage(chain_spec::FromGenesisStorageError),
+    /// The list of potential relay chains doesn't contain any relay chain with the name indicated
+    /// in the chain specification of the parachain.
+    #[display(fmt = "Couldn't find relevant relay chain")]
+    NoRelayChainFound,
+    /// The list of potential relay chains contains more than one relay chain with the name
+    /// indicated in the chain specification of the parachain.
+    #[display(fmt = "Multiple relevant relay chains found")]
+    MultipleRelayChains,
+}
+
+/// Starts all the services of the client.
+///
+/// Returns some of the services that have been started. If these service get shut down, all the
+/// other services will later shut down as well.
+async fn start_services<TPlat: platform::Platform>(
+    log_name: String,
+    spawn_new_task: Arc<
+        dyn Fn(String, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync,
+    >,
+    chain_information: chain::chain_information::ValidChainInformation,
+    genesis_block_scale_encoded_header: Vec<u8>,
+    chain_spec: chain_spec::ChainSpec,
+    relay_chain: Option<&ChainServices<TPlat>>,
+    network_noise_key: connection::NoiseKey,
+) -> ChainServices<TPlat> {
+    // Since `network_noise_key` is moved out below, use it to build the network identity ahead
+    // of the network service starting.
+    let network_identity =
+        peer_id::PublicKey::Ed25519(*network_noise_key.libp2p_public_ed25519_key()).into_peer_id();
+
+    // The network service is responsible for connecting to the peer-to-peer network.
+    let (network_service, mut network_event_receivers) =
+        network_service::NetworkService::new(network_service::Config {
+            tasks_executor: Box::new({
+                let spawn_new_task = spawn_new_task.clone();
+                move |name, fut| spawn_new_task(name, fut)
+            }),
+            num_events_receivers: 1, // Configures the length of `network_event_receivers`
+            noise_key: network_noise_key,
+            chains: vec![network_service::ConfigChain {
+                log_name: log_name.clone(),
+                has_grandpa_protocol: matches!(
+                    chain_information.as_ref().finality,
+                    chain::chain_information::ChainInformationFinalityRef::Grandpa { .. }
+                ),
+                genesis_block_hash: header::hash_from_scale_encoded_header(
+                    &genesis_block_scale_encoded_header,
+                ),
+                finalized_block_height: chain_information.as_ref().finalized_block_header.number,
+                best_block: (
+                    chain_information.as_ref().finalized_block_header.number,
+                    chain_information
+                        .as_ref()
+                        .finalized_block_header
+                        .hash(chain_spec.block_number_bytes().into()),
+                ),
+                fork_id: chain_spec.fork_id().map(|n| n.to_owned()),
+                block_number_bytes: usize::from(chain_spec.block_number_bytes()),
+            }],
+        })
+        .await;
+
+    let (sync_service, runtime_service) = if let Some(relay_chain) = relay_chain {
+        // Chain is a parachain.
+
+        // The sync service is leveraging the network service, downloads block headers,
+        // and verifies them, to determine what are the best and finalized blocks of the
+        // chain.
+        let sync_service = Arc::new(
+            sync_service::SyncService::new(sync_service::Config {
+                log_name: log_name.clone(),
+                chain_information: chain_information.clone(),
+                block_number_bytes: usize::from(chain_spec.block_number_bytes()),
+                tasks_executor: Box::new({
+                    let spawn_new_task = spawn_new_task.clone();
+                    move |name, fut| spawn_new_task(name, fut)
+                }),
+                network_service: (network_service.clone(), 0),
+                network_events_receiver: network_event_receivers.pop().unwrap(),
+                parachain: Some(sync_service::ConfigParachain {
+                    parachain_id: chain_spec.relay_chain().unwrap().1,
+                    relay_chain_sync: relay_chain.runtime_service.clone(),
+                    relay_chain_block_number_bytes: relay_chain.block_number_bytes,
+                }),
+            })
+            .await,
+        );
+
+        // The runtime service follows the runtime of the best block of the chain,
+        // and allows performing runtime calls.
+        let runtime_service = Arc::new(
+            runtime_service::RuntimeService::new(runtime_service::Config {
+                log_name: log_name.clone(),
+                tasks_executor: Box::new({
+                    let spawn_new_task = spawn_new_task.clone();
+                    move |name, fut| spawn_new_task(name, fut)
+                }),
+                sync_service: sync_service.clone(),
+                genesis_block_scale_encoded_header,
+            })
+            .await,
+        );
+
+        (sync_service, runtime_service)
+    } else {
+        // Chain is a relay chain.
+
+        // The sync service is leveraging the network service, downloads block headers,
+        // and verifies them, to determine what are the best and finalized blocks of the
+        // chain.
+        let sync_service = Arc::new(
+            sync_service::SyncService::new(sync_service::Config {
+                log_name: log_name.clone(),
+                chain_information: chain_information.clone(),
+                block_number_bytes: usize::from(chain_spec.block_number_bytes()),
+                tasks_executor: Box::new({
+                    let spawn_new_task = spawn_new_task.clone();
+                    move |name, fut| spawn_new_task(name, fut)
+                }),
+                network_service: (network_service.clone(), 0),
+                network_events_receiver: network_event_receivers.pop().unwrap(),
+                parachain: None,
+            })
+            .await,
+        );
+
+        // The runtime service follows the runtime of the best block of the chain,
+        // and allows performing runtime calls.
+        let runtime_service = Arc::new(
+            runtime_service::RuntimeService::new(runtime_service::Config {
+                log_name: log_name.clone(),
+                tasks_executor: Box::new({
+                    let spawn_new_task = spawn_new_task.clone();
+                    move |name, fut| spawn_new_task(name, fut)
+                }),
+                sync_service: sync_service.clone(),
+                genesis_block_scale_encoded_header,
+            })
+            .await,
+        );
+
+        (sync_service, runtime_service)
+    };
+
+    // The transactions service lets one send transactions to the peer-to-peer network and watch
+    // them being included in the chain.
+    // While this service is in principle not needed if it is known ahead of time that no
+    // transaction will be submitted, the service itself is pretty low cost.
+    let transactions_service = Arc::new(
+        transactions_service::TransactionsService::new(transactions_service::Config {
+            log_name,
+            tasks_executor: Box::new(move |name, fut| spawn_new_task(name, fut)),
+            sync_service: sync_service.clone(),
+            runtime_service: runtime_service.clone(),
+            network_service: (network_service.clone(), 0),
+            max_pending_transactions: NonZeroU32::new(64).unwrap(),
+            max_concurrent_downloads: NonZeroU32::new(3).unwrap(),
+            max_concurrent_validations: NonZeroU32::new(2).unwrap(),
+        })
+        .await,
+    );
+
+    ChainServices {
+        network_service,
+        network_identity,
+        runtime_service,
+        sync_service,
+        transactions_service,
+        block_number_bytes: usize::from(chain_spec.block_number_bytes()),
+    }
+}

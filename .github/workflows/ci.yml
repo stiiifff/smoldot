@@ -19,15 +19,18 @@ name: continuous-integration
 
 on:
   pull_request:
+  merge_group:
   push:
     branches:
       - main   # Running the CI on the main branch is important in order to fill the caches that pull requests will pick up.
+
+permissions: read-all
 
 jobs:
   test-64bits:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
@@ -36,7 +39,7 @@ jobs:
   test-32bits:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - run: apt-get update && apt install -y libc6-dev-i386
     - uses: actions/checkout@v3
@@ -47,41 +50,42 @@ jobs:
   wasm-node-check:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - run: apt-get update && apt install -y binaryen # For `wasm-opt`
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
-    - uses: actions/setup-node@v3.5.1
+    - uses: actions/setup-node@v3.6.0
       with:
         node-version: '16'  # An old version is used to ensure compatibility
     - uses: denoland/setup-deno@v1
       with:
         deno-version: v1.x
-    - run: cd bin/wasm-node/javascript && RUSTFLAGS=-Dwarnings npm install-ci-test
+    - run: cd wasm-node/javascript && RUSTFLAGS=-Dwarnings npm install-ci-test
 
   wasm-node-size-diff:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - run: apt-get update && apt install -y binaryen # For `wasm-opt`
     - uses: actions/checkout@v3
       with:
         fetch-depth: 0  # Necessary to fetch pull request base below
+    - run: git config --system --add safe.directory /__w/smoldot/smoldot  # TODO: this is a temporary workaround for https://github.com/actions/checkout/issues/1169
     - uses: Swatinem/rust-cache@v2
-    - uses: actions/setup-node@v3.5.1
+    - uses: actions/setup-node@v3.6.0
       with:
         node-version: '14'  # Because this step doesn't actually check anything, we use a more liberal version
     - uses: baptiste0928/cargo-install@v1  # This action ensures that the twiggy compilation is cached.
       with:
         crate: twiggy
-        version: 0.6
+        version: 0.7
     - run: git checkout ${{ github.event.pull_request.base.sha }}
-    - run: cd bin/wasm-node/javascript && npm ci && npm run-script build
+    - run: cd wasm-node/javascript && npm ci && npm run-script build
     - run: cp ./target/wasm32-wasi/min-size-release/smoldot_light_wasm.wasm ./.ci-parent-build.wasm  # TODO: maybe get the path from the `npm build` output or something?
     - run: git checkout ${{ github.event.pull_request.head.sha }}
-    - run: cd bin/wasm-node/javascript && npm ci && npm run-script build
+    - run: cd wasm-node/javascript && npm ci && npm run-script build
     - run: twiggy diff ./.ci-parent-build.wasm ./target/wasm32-wasi/min-size-release/smoldot_light_wasm.wasm > ./twiggy-diff  # TODO: maybe get the path from the `npm build` output or something?
     # Now that we've generated the diff in a `./twiggy-diff` file, the next step is to upload
     # the PR number and diff content as an artifact that will then be picked up by a
@@ -98,7 +102,7 @@ jobs:
   check-features:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
@@ -128,7 +132,7 @@ jobs:
         # Since build artifacts are specific to a nightly version, we pin the specific nightly
         # version to use in order to not invalidate the build cache every day. The exact version
         # is completely arbitrary.
-        toolchain: nightly-2022-10-16
+        toolchain: nightly-2023-02-24
         override: true
     - uses: baptiste0928/cargo-install@v1  # This action ensures that the compilation is cached.
       with:
@@ -136,13 +140,13 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: |
-          ./bin/fuzz
-    - run: cargo fuzz build --fuzz-dir ./bin/fuzz
+          ./fuzz
+    - run: cargo fuzz build --fuzz-dir ./fuzz
 
   check-rustdoc-links:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.65
+      image: rust:1.67
     steps:
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
@@ -166,7 +170,7 @@ jobs:
         # The fuzzing targets are in a different package and thus need to be checked separately.
         with:
           command: fmt
-          args: --manifest-path ./bin/fuzz/Cargo.toml --all -- --check
+          args: --manifest-path ./fuzz/Cargo.toml --all -- --check
 
   # TODO: as explained in the official repo (https://github.com/actions-rs/clippy), this action uses unstable GH actions features, but has the huge advantage of not requiring `GITHUB_TOKEN` and working on PRs from forked repositories ; should eventually replace `actions-rs/clippy@master` with a specific version
   clippy:
@@ -219,9 +223,9 @@ jobs:
           override: true
       # Compares whether the version in `package.json` matches the version in `Cargo.toml`.
       - id: js-version
-        run: echo "::set-output name=version::`jq .version ./bin/wasm-node/javascript/package.json`"
+        run: echo "::set-output name=version::`jq .version ./wasm-node/javascript/package.json`"
       - id: rust-version
-        run: echo "::set-output name=version::`cargo read-manifest --manifest-path=./bin/wasm-node/rust/Cargo.toml | jq .version`"
+        run: echo "::set-output name=version::`cargo read-manifest --manifest-path=./wasm-node/rust/Cargo.toml | jq .version`"
       - run: exit 1
         if: ${{ steps.js-version.outputs.version == '' }}   # Defensive test against mistakes in the CI script
       - run: exit 1
