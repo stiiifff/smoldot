@@ -163,6 +163,12 @@ impl From<usize> for ChainId {
     }
 }
 
+impl From<ChainId> for usize {
+    fn from(chain_id: ChainId) -> usize {
+        chain_id.0
+    }
+}
+
 /// Holds a list of chains, connections, and JSON-RPC services.
 pub struct Client<TPlat: platform::Platform, TChain = ()> {
     /// Tasks can be spawned by calling this function. The first parameter is the name of the task
