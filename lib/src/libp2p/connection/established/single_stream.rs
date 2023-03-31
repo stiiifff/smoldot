@@ -53,8 +53,8 @@
 use super::{
     super::{super::read_write::ReadWrite, noise, yamux},
     substream::{self, RespondInRequestError},
-    Config, ConfigNotifications, ConfigRequestResponse, ConfigRequestResponseIn, Event,
-    SubstreamId, SubstreamIdInner,
+    AddRequestError, Config, ConfigNotifications, ConfigRequestResponse, ConfigRequestResponseIn,
+    Event, SubstreamId, SubstreamIdInner,
 };
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
@@ -280,7 +280,7 @@ where
             if let Some(incoming_data) = read_write.incoming_buffer.as_mut() {
                 let num_read = self
                     .encryption
-                    .inject_inbound_data(*incoming_data)
+                    .inject_inbound_data(incoming_data)
                     .map_err(Error::Noise)?;
                 read_write.advance_read(num_read);
             }
@@ -514,7 +514,7 @@ where
                 // TODO: don't allocate an intermediary buffer, but instead pass them directly to the encryption
                 let mut buffers = Vec::with_capacity(32);
                 let mut extract_out = self.inner.yamux.extract_out(unencrypted_bytes_to_extract);
-                while let Some(buffer) = extract_out.next() {
+                while let Some(buffer) = extract_out.extract_next() {
                     buffers.push(buffer.as_ref().to_vec()); // TODO: copy
                 }
 
@@ -794,16 +794,18 @@ where
         request: Vec<u8>,
         timeout: TNow,
         user_data: TRqUd,
-    ) -> SubstreamId {
+    ) -> Result<SubstreamId, AddRequestError> {
         let has_length_prefix = match self.inner.request_protocols[protocol_index].inbound_config {
             ConfigRequestResponseIn::Payload { max_size } => {
-                // TODO: turn this assert into something that can't panic?
-                assert!(request.len() <= max_size);
+                if request.len() > max_size {
+                    return Err(AddRequestError::RequestTooLarge);
+                }
                 true
             }
             ConfigRequestResponseIn::Empty => {
-                // TODO: turn this assert into something that can't panic?
-                assert!(request.is_empty());
+                if !request.is_empty() {
+                    return Err(AddRequestError::RequestTooLarge);
+                }
                 false
             }
         };
@@ -830,7 +832,7 @@ where
                 .saturating_add(64),
         );
 
-        SubstreamId(SubstreamIdInner::SingleStream(substream.id()))
+        Ok(SubstreamId(SubstreamIdInner::SingleStream(substream.id())))
     }
 
     /// Returns the user data associated to a notifications substream.

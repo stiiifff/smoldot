@@ -840,14 +840,11 @@ impl<TRq, TSrc, TBl> AllSync<TRq, TSrc, TBl> {
         hash: [u8; 32],
     ) {
         debug_assert!(self.shared.sources.contains(source_id.0));
-        match (
+        if let (AllSyncInner::AllForks(sync), SourceMapping::AllForks(src)) = (
             &mut self.inner,
             self.shared.sources.get(source_id.0).unwrap(),
         ) {
-            (AllSyncInner::AllForks(sync), SourceMapping::AllForks(src)) => {
-                sync.add_known_block_to_source(*src, height, hash)
-            }
-            _ => {}
+            sync.add_known_block_to_source(*src, height, hash)
         }
     }
 
@@ -2120,14 +2117,14 @@ pub struct BlockFull {
     pub body: Vec<Vec<u8>>,
 
     /// Changes to the storage made by this block compared to its parent.
-    pub storage_top_trie_changes: storage_diff::StorageDiff,
+    pub storage_main_trie_changes: storage_diff::TrieDiff,
 
     /// State trie version indicated by the runtime. All the storage changes indicated by
-    /// [`BlockFull::storage_top_trie_changes`] should store this version alongside with them.
+    /// [`BlockFull::storage_main_trie_changes`] should store this version alongside with them.
     pub state_trie_version: TrieEntryVersion,
 
     /// List of changes to the off-chain storage that this block performs.
-    pub offchain_storage_changes: storage_diff::StorageDiff,
+    pub offchain_storage_changes: storage_diff::TrieDiff,
 }
 
 pub struct HeaderVerify<TRq, TSrc, TBl> {
@@ -2337,7 +2334,7 @@ impl<TRq, TSrc, TBl> FinalityProofVerify<TRq, TSrc, TBl> {
                                 full: b.full.map(|b| BlockFull {
                                     body: b.body,
                                     offchain_storage_changes: b.offchain_storage_changes,
-                                    storage_top_trie_changes: b.storage_top_trie_changes,
+                                    storage_main_trie_changes: b.storage_main_trie_changes,
                                     state_trie_version: b.state_trie_version,
                                 }),
                             })
@@ -2833,9 +2830,10 @@ impl<TRq> Shared<TRq> {
             let (source_id, _) = self
                 .sources
                 .iter()
-                .find(|(_, s)| match s {
-                    SourceMapping::GrandpaWarpSync(s) if *s == source_id => true,
-                    _ => false,
+                .find(|(_, s)| {
+                    matches!(s,
+                        SourceMapping::GrandpaWarpSync(s) if *s == source_id
+                    )
                 })
                 .unwrap();
 

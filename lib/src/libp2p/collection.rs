@@ -47,7 +47,9 @@
 //! the calls to [`Network::inject_connection_message`].
 //!
 
-use super::connection::{established, single_stream_handshake, NoiseKey};
+use crate::libp2p::connection::noise;
+
+use super::connection::{established, single_stream_handshake};
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
@@ -77,14 +79,17 @@ mod multi_stream;
 mod single_stream;
 
 /// What kind of handshake to perform on the newly-added connection.
-pub enum SingleStreamHandshakeKind {
+pub enum SingleStreamHandshakeKind<'a> {
     /// Use the multistream-select protocol to negotiate the Noise encryption, then use the
     /// multistream-select protocol to negotiate the Yamux multiplexing.
-    MultistreamSelectNoiseYamux,
+    MultistreamSelectNoiseYamux {
+        /// Local secret key to use for the handshake.
+        noise_key: &'a noise::NoiseKey,
+    },
 }
 
 /// What kind of handshake to perform on the newly-added connection.
-pub enum MultiStreamHandshakeKind {
+pub enum MultiStreamHandshakeKind<'a> {
     /// The connection is a WebRTC connection.
     ///
     /// See <https://github.com/libp2p/specs/pull/412> for details.
@@ -92,6 +97,8 @@ pub enum MultiStreamHandshakeKind {
     /// The reading and writing side of substreams must never be closed. Substreams can only be
     /// abruptly destroyed by either side.
     WebRtc {
+        /// Local secret key to use for the handshake.
+        noise_key: &'a noise::NoiseKey,
         /// Multihash encoding of the TLS certificate used by the local node at the DTLS layer.
         local_tls_certificate_multihash: Vec<u8>,
         /// Multihash encoding of the TLS certificate used by the remote node at the DTLS layer.
@@ -123,11 +130,6 @@ pub struct Config {
 
     /// Name of the ping protocol on the network.
     pub ping_protocol: String,
-
-    /// Key used for the encryption layer.
-    /// This is a Noise static key, according to the Noise specification.
-    /// Signed using the actual libp2p key.
-    pub noise_key: NoiseKey,
 }
 
 /// Configuration for a specific overlay network.
@@ -255,9 +257,6 @@ pub struct Network<TConn, TNow> {
     /// See [`Config::handshake_timeout`].
     handshake_timeout: Duration,
 
-    /// See [`Config::noise_key`].
-    noise_key: Arc<NoiseKey>,
-
     /// See [`OverlayNetwork`].
     notification_protocols: Arc<[OverlayNetwork]>,
 
@@ -354,7 +353,6 @@ where
             ),
             ingoing_notification_substreams_by_connection: BTreeMap::new(),
             randomness_seeds: ChaCha20Rng::from_seed(config.randomness_seed),
-            noise_key: Arc::new(config.noise_key),
             max_inbound_substreams: config.max_inbound_substreams,
             notification_protocols,
             request_response_protocols: config.request_response_protocols.into_iter().collect(), // TODO: stupid overhead
@@ -379,17 +377,22 @@ where
         let connection_id = self.next_connection_id;
         self.next_connection_id.0 += 1;
 
-        let connection_task = SingleStreamConnectionTask::new(
-            self.randomness_seeds.gen(),
-            is_initiator,
-            handshake_kind,
-            when_connected + self.handshake_timeout,
-            self.noise_key.clone(),
-            self.max_inbound_substreams,
-            self.notification_protocols.clone(),
-            self.request_response_protocols.clone(),
-            self.ping_protocol.clone(),
-        );
+        // We only support one kind of handshake at the moment. Make sure (at compile time) that
+        // the value provided as parameter is indeed the one expected.
+        let SingleStreamHandshakeKind::MultistreamSelectNoiseYamux { noise_key } = handshake_kind;
+
+        let connection_task = SingleStreamConnectionTask::new(single_stream::Config {
+            randomness_seed: self.randomness_seeds.gen(),
+            handshake: single_stream_handshake::HealthyHandshake::noise_yamux(
+                noise_key,
+                is_initiator,
+            ),
+            handshake_timeout: when_connected + self.handshake_timeout,
+            max_inbound_substreams: self.max_inbound_substreams,
+            notification_protocols: self.notification_protocols.clone(),
+            request_response_protocols: self.request_response_protocols.clone(),
+            ping_protocol: self.ping_protocol.clone(),
+        });
 
         let _previous_value = self.connections.insert(
             connection_id,
@@ -420,13 +423,45 @@ where
         let connection_id = self.next_connection_id;
         self.next_connection_id.0 += 1;
 
+        // In the WebRTC handshake, the Noise prologue must be set to `"libp2p-webrtc-noise:"`
+        // followed with the multihash-encoded fingerprints of the initiator's certificate
+        // and the receiver's certificate.
+        // See <https://github.com/libp2p/specs/pull/412>.
+        let (noise_key, noise_prologue) = {
+            let MultiStreamHandshakeKind::WebRtc {
+                noise_key,
+                local_tls_certificate_multihash,
+                remote_tls_certificate_multihash,
+            } = handshake_kind;
+            const PREFIX: &[u8] = b"libp2p-webrtc-noise:";
+            let mut out = Vec::with_capacity(
+                PREFIX.len()
+                    + local_tls_certificate_multihash.len()
+                    + remote_tls_certificate_multihash.len(),
+            );
+            out.extend_from_slice(PREFIX);
+            if is_initiator {
+                out.extend_from_slice(&local_tls_certificate_multihash);
+                out.extend_from_slice(&remote_tls_certificate_multihash);
+            } else {
+                out.extend_from_slice(&remote_tls_certificate_multihash);
+                out.extend_from_slice(&local_tls_certificate_multihash);
+            }
+            (noise_key, out)
+        };
+
+        let handshake = noise::HandshakeInProgress::new(noise::Config {
+            key: &noise_key,
+            // It's the "server" that initiates the Noise handshake.
+            is_initiator: !is_initiator,
+            prologue: &noise_prologue,
+        });
+
         let connection_task = MultiStreamConnectionTask::new(
             self.randomness_seeds.gen(),
-            is_initiator,
             now,
-            handshake_kind,
+            handshake,
             self.max_inbound_substreams,
-            self.noise_key.clone(),
             self.notification_protocols.clone(),
             self.request_response_protocols.clone(),
             self.ping_protocol.clone(),
@@ -531,11 +566,6 @@ where
         }
     }
 
-    /// Returns the Noise key originally passed as [`Config::noise_key`].
-    pub fn noise_key(&self) -> &NoiseKey {
-        &self.noise_key
-    }
-
     /// Returns the list the overlay networks originally passed as
     /// [`Config::notification_protocols`].
     pub fn notification_protocols(
@@ -597,7 +627,7 @@ where
         protocol_index: usize,
         request_data: impl Into<Vec<u8>>,
         timeout: TNow,
-    ) -> SubstreamId {
+    ) -> Result<SubstreamId, StartRequestError> {
         let connection = match self.connections.get(&target) {
             Some(c) => c,
             None => panic!(),
@@ -607,10 +637,21 @@ where
             InnerConnectionState::Established
         ));
 
-        assert!(self
-            .request_response_protocols
-            .get(protocol_index)
-            .is_some());
+        let request_data = request_data.into();
+
+        // We check the size limit before sending the message. This size limit is the only reason
+        // why start a request can fail. By checking it here, we are guaranteed that the request
+        // start will succeed in the background.
+        if request_data.len()
+            > self
+                .request_response_protocols
+                .get(protocol_index)
+                .unwrap_or_else(|| panic!())
+                .inbound_config
+                .max_size()
+        {
+            return Err(StartRequestError::RequestTooLarge);
+        }
 
         let substream_id = self.next_substream_id;
         self.next_substream_id.0 += 1;
@@ -622,13 +663,13 @@ where
             target,
             CoordinatorToConnectionInner::StartRequest {
                 protocol_index,
-                request_data: request_data.into(),
+                request_data,
                 timeout,
                 substream_id,
             },
         ));
 
-        substream_id
+        Ok(substream_id)
     }
 
     /// Start opening a notifications substream.
@@ -1493,6 +1534,13 @@ impl<TConn, TNow> ops::IndexMut<ConnectionId> for Network<TConn, TNow> {
     }
 }
 
+/// Error potentially returned when starting a request.
+#[derive(Debug, Clone, derive_more::Display)]
+pub enum StartRequestError {
+    /// Size of the request is over maximum allowed by the protocol.
+    RequestTooLarge,
+}
+
 /// See [`Network::connection_state`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ConnectionState {
@@ -1619,6 +1667,7 @@ enum CoordinatorToConnectionInner<TNow> {
 
     StartRequest {
         protocol_index: usize,
+        /// The size of the data is guaranteed to fit in the maximum allowed.
         request_data: Vec<u8>,
         timeout: TNow,
         /// Id of the substream assigned by the coordinator.

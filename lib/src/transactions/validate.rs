@@ -167,7 +167,7 @@ pub enum InvalidTransaction {
     /// left in the current block.
     ExhaustsResources,
     /// Any other custom invalid validity that is not covered by this enum.
-    #[display(fmt = "Other reason (code: {})", _0)]
+    #[display(fmt = "Other reason (code: {_0})")]
     Custom(u8),
     /// An extrinsic with a Mandatory dispatch resulted in Error. This is indicative of either a
     /// malicious validator or a buggy `provide_inherent`. In any case, it can result in dangerously
@@ -186,7 +186,7 @@ pub enum UnknownTransaction {
     /// No validator found for the given unsigned transaction.
     NoUnsignedValidator,
     /// Any other custom unknown validity that is not covered by this enum.
-    #[display(fmt = "Other reason (code: {})", _0)]
+    #[display(fmt = "Other reason (code: {_0})")]
     Custom(u8),
 }
 
@@ -332,9 +332,9 @@ pub fn validate_transaction(
                     digest: header::DigestRef::empty(),
                 }
                 .scale_encoding(config.block_number_bytes),
-                top_trie_root_calculation_cache: None,
-                storage_top_trie_changes: storage_diff::StorageDiff::empty(),
-                offchain_storage_changes: storage_diff::StorageDiff::empty(),
+                main_trie_root_calculation_cache: None,
+                storage_main_trie_changes: storage_diff::TrieDiff::empty(),
+                offchain_storage_changes: storage_diff::TrieDiff::empty(),
                 max_log_level: config.max_log_level,
             });
 
@@ -369,9 +369,9 @@ pub fn validate_transaction(
                     config.source,
                     &header::hash_from_scale_encoded_header(config.scale_encoded_header),
                 ),
-                top_trie_root_calculation_cache: None,
-                storage_top_trie_changes: storage_diff::StorageDiff::empty(),
-                offchain_storage_changes: storage_diff::StorageDiff::empty(),
+                main_trie_root_calculation_cache: None,
+                storage_main_trie_changes: storage_diff::TrieDiff::empty(),
+                offchain_storage_changes: storage_diff::TrieDiff::empty(),
                 max_log_level: config.max_log_level,
             });
 
@@ -459,10 +459,10 @@ impl Query {
                             iter::once(info.scale_encoded_transaction),
                             info.transaction_source,
                         ),
-                        storage_top_trie_changes: success.storage_top_trie_changes,
+                        storage_main_trie_changes: success.storage_main_trie_changes,
                         offchain_storage_changes: success.offchain_storage_changes,
-                        top_trie_root_calculation_cache: Some(
-                            success.top_trie_root_calculation_cache,
+                        main_trie_root_calculation_cache: Some(
+                            success.main_trie_root_calculation_cache,
                         ),
                         max_log_level: 0,
                     });

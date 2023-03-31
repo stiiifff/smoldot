@@ -64,7 +64,7 @@ export function start(options?: ClientOptions): Client {
         return performance.now()
     },
     getRandomValues: (buffer) => {
-      if (buffer.length >= 65536)
+      if (buffer.length >= 1024 * 1024)
         throw new Error('getRandomValues buffer too large')
       randomFillSync(buffer)
     },
@@ -102,8 +102,34 @@ function connect(config: ConnectionConfig, forbidTcp: boolean, forbidWs: boolean
 
         const socket = new WebSocket(url);
         socket.binaryType = 'arraybuffer';
+
+        const bufferedAmountCheck = { quenedUnreportedBytes: 0, nextTimeout: 10 };
+        const checkBufferedAmount = () => {
+            if (socket.readyState != 1)
+                return;
+            // Note that we might expect `bufferedAmount` to always be <= the sum of the lengths
+            // of all the data that has been sent, but that seems to not be the case. It is
+            // unclear whether this is intended or a bug, but is is likely that `bufferedAmount`
+            // also includes WebSocket headers. For this reason, we use `bufferedAmount` as a hint
+            // rather than a correct value.
+            const bufferedAmount = socket.bufferedAmount;
+            let wasSent = bufferedAmountCheck.quenedUnreportedBytes - bufferedAmount;
+            if (wasSent < 0) wasSent = 0;
+            bufferedAmountCheck.quenedUnreportedBytes -= wasSent;
+            if (bufferedAmountCheck.quenedUnreportedBytes != 0) {
+                setTimeout(checkBufferedAmount, bufferedAmountCheck.nextTimeout);
+                bufferedAmountCheck.nextTimeout *= 2;
+                if (bufferedAmountCheck.nextTimeout > 500)
+                    bufferedAmountCheck.nextTimeout = 500;
+            }
+            // Note: it is important to call `onWritableBytes` at the very end, as it might
+            // trigger a call to `send`.
+            if (wasSent != 0)
+                config.onWritableBytes(wasSent);
+        };
+
         socket.onopen = () => {
-            config.onOpen({ type: 'single-stream', handshake: 'multistream-select-noise-yamux' });
+            config.onOpen({ type: 'single-stream', handshake: 'multistream-select-noise-yamux', initialWritableBytes: 1024 * 1024, writeClosable: false });
         };
         socket.onclose = (event) => {
             const message = "Error code " + event.code + (!!event.reason ? (": " + event.reason) : "");
@@ -136,7 +162,13 @@ function connect(config: ConnectionConfig, forbidTcp: boolean, forbidWs: boolean
             },
             send: (data: Uint8Array): void => {
                 socket.send(data);
+                if (bufferedAmountCheck.quenedUnreportedBytes == 0) {
+                  bufferedAmountCheck.nextTimeout = 10;
+                  setTimeout(checkBufferedAmount, 10);
+                }
+                bufferedAmountCheck.quenedUnreportedBytes += data.length;
             },
+            closeSend: (): void => { throw new Error('Wrong connection type') },
             openOutSubstream: () => { throw new Error('Wrong connection type') }
         };
 
@@ -151,11 +183,17 @@ function connect(config: ConnectionConfig, forbidTcp: boolean, forbidWs: boolean
             port: parseInt(tcpParsed[3]!, 10),
         });
 
+        // Number of bytes queued using `socket.write` and where `write` has returned false.
+        const drainingBytes = { num: 0 };
+
         socket.setNoDelay();
 
         socket.on('connect', () => {
             if (socket.destroyed) return;
-            config.onOpen({ type: 'single-stream', handshake: 'multistream-select-noise-yamux' });
+            config.onOpen({
+                type: 'single-stream', handshake: 'multistream-select-noise-yamux',
+                initialWritableBytes: socket.writableHighWaterMark, writeClosable: true
+            });
         });
         socket.on('close', (hasError) => {
             if (socket.destroyed) return;
@@ -169,13 +207,33 @@ function connect(config: ConnectionConfig, forbidTcp: boolean, forbidWs: boolean
             if (socket.destroyed) return;
             config.onMessage(new Uint8Array(message.buffer));
         });
+        socket.on('drain', () => {
+            // The bytes queued using `socket.write` and where `write` has returned false have now
+            // been sent. Notify the API that it can write more data.
+            if (socket.destroyed) return;
+            const val = drainingBytes.num;
+            drainingBytes.num = 0;
+            config.onWritableBytes(val);
+        });
 
         return {
             reset: (): void => {
                 socket.destroy();
             },
             send: (data: Uint8Array): void => {
-                socket.write(data);
+                const dataLen = data.length;
+                const allWritten = socket.write(data);
+                if (allWritten) {
+                    setImmediate(() => {
+                        if (!socket.writable) return;
+                        config.onWritableBytes(dataLen)
+                    });
+                } else {
+                    drainingBytes.num += dataLen;
+                }
+            },
+            closeSend: (): void => {
+                socket.end();
             },
             openOutSubstream: () => { throw new Error('Wrong connection type') }
         };

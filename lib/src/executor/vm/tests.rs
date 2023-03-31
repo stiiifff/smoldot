@@ -31,13 +31,12 @@ fn is_send() {
 #[test]
 fn basic_seems_to_work() {
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(
-            &include_bytes!("./test-polkadot-runtime-v9160.wasm")[..],
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &include_bytes!("./test-polkadot-runtime-v9160.wasm")[..],
             exec_hint,
-        )
+            symbols: &mut |_, _, _| Ok(0),
+        })
         .unwrap();
-
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
 
         // Note that this test doesn't test much, as anything elaborate would require implementing
         // the Substrate/Polkadot allocator.
@@ -69,41 +68,52 @@ fn basic_seems_to_work() {
 #[test]
 fn out_of_memory_access() {
     for exec_hint in super::ExecHint::available_engines() {
-        let input = [
+        let module_bytes = [
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x05, 0x03, 0x01, 0x00, 0x00, 0x0b,
             0x06, 0x01, 0x00, 0x41, 0x03, 0x0b, 0x00,
         ];
 
-        let module = super::Module::new(input, exec_hint).unwrap();
-        assert!(super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).is_err());
+        assert!(super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes[..],
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0)
+        })
+        .is_err());
     }
 }
 
 #[test]
 fn has_start_function() {
     for exec_hint in super::ExecHint::available_engines() {
-        let input = [
+        let module_bytes = [
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
             0x02, 0x09, 0x01, 0x01, 0x71, 0x03, 0x69, 0x6d, 0x70, 0x00, 0x00, 0x08, 0x01, 0x00,
         ];
 
-        let module = super::Module::new(input, exec_hint).unwrap();
-        assert!(super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).is_err());
+        assert!(super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes[..],
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0)
+        })
+        .is_err());
     }
 }
 
 #[test]
 fn unsupported_type() {
     for exec_hint in super::ExecHint::available_engines() {
-        let input = [
+        let module_bytes = [
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01,
             0x7b, 0x02, 0x0d, 0x01, 0x04, 0x74, 0x65, 0x73, 0x74, 0x04, 0x66, 0x75, 0x6e, 0x63,
             0x00, 0x00,
         ];
 
-        if let Ok(module) = super::Module::new(input, exec_hint) {
-            assert!(super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).is_err());
-        }
+        assert!(super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes[..],
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0)
+        })
+        .is_err());
     }
 }
 
@@ -125,9 +135,12 @@ fn basic_host_function_return_value_works() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare().start("hello", &[]).unwrap();
 
@@ -169,9 +182,12 @@ fn no_memory() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
             Err(super::NewErr::NoMemory)
         ));
     }
@@ -193,9 +209,12 @@ fn memory_misnamed() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
             Err(super::NewErr::MemoryNotNamedMemory)
         ));
     }
@@ -221,12 +240,14 @@ fn two_memories() {
         // Note that at the moment this module fails to compile altogether because the
         // multi-memory Wasm proposal isn't finalized yet. Even once finalized, we want to deny
         // this feature in smoldot.
-        if let Ok(module) = super::Module::new(&module_bytes, exec_hint) {
-            assert!(matches!(
-                super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
-                Err(super::NewErr::TwoMemories)
-            ));
-        }
+        assert!(matches!(
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
+            Err(super::NewErr::InvalidWasm(_) | super::NewErr::TwoMemories)
+        ));
     }
 }
 
@@ -246,8 +267,12 @@ fn exported_memory_works() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
     }
 }
 
@@ -267,9 +292,12 @@ fn unresolved_function() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Err(())),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Err(())
+            }),
             Err(super::NewErr::UnresolvedFunctionImport { .. })
         ));
     }
@@ -289,9 +317,12 @@ fn unsupported_signature() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
             Err(super::NewErr::UnresolvedFunctionImport { .. })
         ));
     }
@@ -311,9 +342,12 @@ fn unsupported_import_type() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
             Err(super::NewErr::ImportTypeNotSupported)
         ));
     }
@@ -333,10 +367,13 @@ fn start_function_forbidden() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
         // TODO: `Ok(_)` shouldn't be accepted, but wasmtime doesn't really make it possible to detect the start function at the moment
         assert!(matches!(
-            super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)),
+            super::VirtualMachinePrototype::new(super::Config {
+                module_bytes: &module_bytes,
+                exec_hint,
+                symbols: &mut |_, _, _| Ok(0)
+            }),
             Err(super::NewErr::StartFunctionNotSupported) | Ok(_)
         ));
     }
@@ -355,8 +392,12 @@ fn max_memory_pages() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert_eq!(
             prototype.memory_max_pages().unwrap(),
             super::HeapPages::new(4096)
@@ -377,8 +418,12 @@ fn get_global() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let mut prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let mut prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert_eq!(prototype.global_value("test").unwrap(), 12);
     }
 }
@@ -396,8 +441,12 @@ fn call_non_existing_function() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert!(matches!(
             prototype.prepare().start("doesntexist", &[]),
             Err((super::StartErr::FunctionNotFound, _))
@@ -418,8 +467,12 @@ fn call_signature_not_supported() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert!(matches!(
             prototype.prepare().start("hello", &[]),
             Err((super::StartErr::SignatureNotSupported, _))
@@ -440,8 +493,12 @@ fn bad_params_types() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert!(matches!(
             prototype.prepare().start("hello", &[]),
             Err((super::StartErr::InvalidParameters, _))
@@ -462,8 +519,12 @@ fn try_to_call_global() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert!(matches!(
             prototype.prepare().start("hello", &[]),
             // TODO: wasmi doesn't properly detect NotAFunction at the moment
@@ -491,9 +552,12 @@ fn wrong_type_provided_initially() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare().start("hello", &[]).unwrap();
 
@@ -520,9 +584,12 @@ fn wrong_type_returned_by_host_function_call() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare().start("hello", &[]).unwrap();
 
@@ -547,8 +614,12 @@ fn memory_min_specified_in_wasm() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         let interpreter = prototype.prepare().start("hello", &[]).unwrap();
         assert_eq!(interpreter.memory_size(), super::HeapPages::new(16));
     }
@@ -567,8 +638,12 @@ fn memory_grow_works() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         let mut interpreter = prototype.prepare().start("hello", &[]).unwrap();
         assert_eq!(interpreter.memory_size(), super::HeapPages::new(16));
         interpreter.grow_memory(super::HeapPages::new(3)).unwrap();
@@ -589,8 +664,12 @@ fn memory_grow_detects_limit() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         let mut interpreter = prototype.prepare().start("hello", &[]).unwrap();
         assert_eq!(interpreter.memory_size(), super::HeapPages::new(16));
         assert!(interpreter.grow_memory(super::HeapPages::new(10)).is_err());
@@ -613,9 +692,12 @@ fn memory_grow_detects_limit_within_host_function() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare().start("hello", &[]).unwrap();
 
@@ -661,9 +743,12 @@ fn globals_reinitialized_after_reset() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-
-        let mut prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let mut prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
         assert_eq!(prototype.global_value("myglob").unwrap(), 5);
 
         let mut vm = prototype.prepare().start("hello", &[]).unwrap();
@@ -692,8 +777,12 @@ fn memory_zeroed_after_reset() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare();
         vm.write_memory(11, &[5, 6]).unwrap();
@@ -736,8 +825,12 @@ fn memory_zeroed_after_prepare() {
     .unwrap();
 
     for exec_hint in super::ExecHint::available_engines() {
-        let module = super::Module::new(&module_bytes, exec_hint).unwrap();
-        let prototype = super::VirtualMachinePrototype::new(&module, |_, _, _| Ok(0)).unwrap();
+        let prototype = super::VirtualMachinePrototype::new(super::Config {
+            module_bytes: &module_bytes,
+            exec_hint,
+            symbols: &mut |_, _, _| Ok(0),
+        })
+        .unwrap();
 
         let mut vm = prototype.prepare();
         assert_eq!(vm.read_memory(11, 2).unwrap().as_ref(), &[0, 0]);

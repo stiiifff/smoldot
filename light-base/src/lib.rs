@@ -65,7 +65,7 @@
 // TODO: talk about the fact that a randomness environment is assumed?
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-#![recursion_limit = "512"]
+#![forbid(unsafe_code)]
 #![deny(rustdoc::broken_intra_doc_links)]
 // TODO: the `unused_crate_dependencies` lint is disabled because of dev-dependencies, see <https://github.com/rust-lang/rust/issues/95513>
 // #![deny(unused_crate_dependencies)]
@@ -146,7 +146,7 @@ pub struct AddChainConfig<'a, TChain, TRelays> {
     /// be wrong to connect to the "Kusama" created by user A.
     pub potential_relay_chains: TRelays,
 
-    /// If `false`, then no JSON-RPC service is started for this chain. This saves up a lot of
+    /// If `true`, then no JSON-RPC service is started for this chain. This saves up a lot of
     /// resources, but will cause all JSON-RPC requests targeting this chain to fail.
     pub disable_json_rpc: bool,
 }
@@ -832,6 +832,8 @@ impl<TPlat: platform::Platform, TChain> Client<TPlat, TChain> {
                 log_name: log_name.clone(), // TODO: add a way to differentiate multiple different json-rpc services under the same chain
                 max_pending_requests: NonZeroU32::new(128).unwrap(),
                 max_subscriptions: 1024, // Note: the PolkadotJS UI is very heavy in terms of subscriptions.
+                max_parallel_requests: NonZeroU32::new(24).unwrap(),
+                max_parallel_subscription_updates: NonZeroU32::new(8).unwrap(),
             });
 
             let spawn_new_task = self.spawn_new_task.clone();
@@ -855,8 +857,6 @@ impl<TPlat: platform::Platform, TChain> Client<TPlat, TChain> {
                     system_version,
                     genesis_block_hash,
                     genesis_block_state_root,
-                    max_parallel_requests: NonZeroU32::new(24).unwrap(),
-                    max_parallel_subscription_updates: NonZeroU32::new(8).unwrap(),
                 })
             };
 

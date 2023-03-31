@@ -51,6 +51,8 @@ export function start(options?: ClientOptions): Client {
       return Promise.resolve(inflate(classicDecode(input)))
     },
     registerShouldPeriodicallyYield: (callback) => {
+      if (typeof document === 'undefined')   // We might be in a web worker.
+        return [false, () => {}];
       const wrappedCallback = () => callback(document.visibilityState === 'visible');
       document.addEventListener('visibilitychange', wrappedCallback);
       return [document.visibilityState === 'visible', () => { document.removeEventListener('visibilitychange', wrappedCallback) }]
@@ -87,11 +89,9 @@ export function start(options?: ClientOptions): Client {
   // TODO: remove support for `/wss` in a long time (https://github.com/paritytech/smoldot/issues/1940)
   const wsParsed = config.address.match(/^\/(ip4|ip6|dns4|dns6|dns)\/(.*?)\/tcp\/(.*?)\/(ws|wss|tls\/ws)$/);
 
-  const webRTCParsed = config.address.match(/^\/(ip4|ip6)\/(.*?)\/udp\/(.*?)\/webrtc\/certhash\/(.*?)$/);
+  const webRTCParsed = config.address.match(/^\/(ip4|ip6)\/(.*?)\/udp\/(.*?)\/webrtc-direct\/certhash\/(.*?)$/);
 
   if (wsParsed != null) {
-      let connection: WebSocket;
-
       const proto = (wsParsed[4] == 'ws') ? 'ws' : 'wss';
       if (
           (proto == 'ws' && forbidWs) ||
@@ -105,11 +105,37 @@ export function start(options?: ClientOptions): Client {
           (proto + "://[" + wsParsed[2] + "]:" + wsParsed[3]) :
           (proto + "://" + wsParsed[2] + ":" + wsParsed[3]);
 
-      connection = new WebSocket(url);
+      const connection = new WebSocket(url);
       connection.binaryType = 'arraybuffer';
 
+      const bufferedAmountCheck = { quenedUnreportedBytes: 0, nextTimeout: 10 };
+      const checkBufferedAmount = () => {
+        if (connection.readyState != 1)
+          return;
+        // Note that we might expect `bufferedAmount` to always be <= the sum of the lengths
+        // of all the data that has been sent, but that might not be the case. For this
+        // reason, we use `bufferedAmount` as a hint rather than a correct value.
+        const bufferedAmount = connection.bufferedAmount;
+        let wasSent = bufferedAmountCheck.quenedUnreportedBytes - bufferedAmount;
+        if (wasSent < 0) wasSent = 0;
+        bufferedAmountCheck.quenedUnreportedBytes -= wasSent;
+        if (bufferedAmountCheck.quenedUnreportedBytes != 0) {
+            setTimeout(checkBufferedAmount, bufferedAmountCheck.nextTimeout);
+            bufferedAmountCheck.nextTimeout *= 2;
+            if (bufferedAmountCheck.nextTimeout > 500)
+                bufferedAmountCheck.nextTimeout = 500;
+        }
+        // Note: it is important to call `onWritableBytes` at the very end, as it might
+        // trigger a call to `send`.
+        if (wasSent != 0)
+            config.onWritableBytes(wasSent);
+      };
+
       connection.onopen = () => {
-          config.onOpen({ type: 'single-stream', handshake: 'multistream-select-noise-yamux' });
+          config.onOpen({
+              type: 'single-stream', handshake: 'multistream-select-noise-yamux',
+              initialWritableBytes: 1024 * 1024, writeClosable: false,
+          });
       };
       connection.onclose = (event) => {
           const message = "Error code " + event.code + (!!event.reason ? (": " + event.reason) : "");
@@ -130,8 +156,14 @@ export function start(options?: ClientOptions): Client {
 
         send: (data: Uint8Array): void => {
             connection.send(data);
+            if (bufferedAmountCheck.quenedUnreportedBytes == 0) {
+              bufferedAmountCheck.nextTimeout = 10;
+              setTimeout(checkBufferedAmount, 10);
+            }
+            bufferedAmountCheck.quenedUnreportedBytes += data.length;
         },
 
+        closeSend: (): void => { throw new Error('Wrong connection type') },
         openOutSubstream: () => { throw new Error('Wrong connection type') }
       };
   } else if (webRTCParsed != null) {
@@ -160,7 +192,7 @@ export function start(options?: ClientOptions): Client {
     // us use the `!` operator more easily and leads to more readable code.
     let pc: RTCPeerConnection | null | undefined = undefined;
     // Contains the data channels that are open and have been reported to smoldot.
-    const dataChannels = new Map<number, RTCDataChannel>();
+    const dataChannels = new Map<number, { channel: RTCDataChannel, bufferedBytes: number }>();
     // For various reasons explained below, we open a data channel in advance without reporting it
     // to smoldot. This data channel is stored in this variable. Once it is reported to smoldot,
     // it is inserted in `dataChannels`.
@@ -187,16 +219,18 @@ export function start(options?: ClientOptions): Client {
       pc!.ondatachannel = null;
 
       for (const channel of Array.from(dataChannels.values())) {
-        channel.onopen = null;
-        channel.onerror = null;
-        channel.onclose = null;
-        channel.onmessage = null;
+        channel.channel.onopen = null;
+        channel.channel.onerror = null;
+        channel.channel.onclose = null;
+        channel.channel.onbufferedamountlow = null;
+        channel.channel.onmessage = null;
       }
       dataChannels.clear();
       if (handshakeDataChannel) {
         handshakeDataChannel.onopen = null;
         handshakeDataChannel.onerror = null;
         handshakeDataChannel.onclose = null;
+        handshakeDataChannel.onbufferedamountlow = null;
         handshakeDataChannel.onmessage = null;
       }
       handshakeDataChannel = undefined;
@@ -229,7 +263,7 @@ export function start(options?: ClientOptions): Client {
           });
         } else {
           console.assert(direction !== 'outbound' || !handshakeDataChannel, "handshakeDataChannel still defined");
-          config.onStreamOpened(dataChannelId, direction);
+          config.onStreamOpened(dataChannelId, direction, 65536);
         }
       };
 
@@ -251,6 +285,7 @@ export function start(options?: ClientOptions): Client {
           handshakeDataChannel.onopen = null;
           handshakeDataChannel.onerror = null;
           handshakeDataChannel.onclose = null;
+          handshakeDataChannel.onbufferedamountlow = null;
           handshakeDataChannel.onmessage = null;
           handshakeDataChannel = undefined;
         } else if (!isOpen) {
@@ -266,13 +301,20 @@ export function start(options?: ClientOptions): Client {
         }
       };
 
+      dataChannel.onbufferedamountlow = () => {
+        const channel = dataChannels.get(dataChannelId)!;
+        const val = channel.bufferedBytes;
+        channel.bufferedBytes = 0;
+        config.onWritableBytes(val, dataChannelId);
+      };
+
       dataChannel.onmessage = (m) => {
         // The `data` field is an `ArrayBuffer`.
         config.onMessage(new Uint8Array(m.data), dataChannelId);
       }
 
       if (direction !== 'first-outbound')
-        dataChannels.set(dataChannelId, dataChannel);
+        dataChannels.set(dataChannelId, { channel: dataChannel, bufferedBytes: 0 });
       else
         handshakeDataChannel = dataChannel
     }
@@ -419,7 +461,8 @@ export function start(options?: ClientOptions): Client {
               // (UDP or TCP)
               "a=sctp-port:5000" + "\n" +
               // The maximum SCTP user message size (in bytes) (RFC8841)
-              "a=max-message-size:16384" + "\n" +  // TODO: should this be part of the spec?
+              // Setting this field is part of the libp2p spec.
+              "a=max-message-size:16384" + "\n" +
               // A transport address for a candidate that can be used for connectivity
               // checks (RFC8839).
               "a=candidate:1 1 UDP 1 " + targetIp + " " + targetPort + " typ host" + "\n";
@@ -452,18 +495,23 @@ export function start(options?: ClientOptions): Client {
 
         } else {
           const channel = dataChannels.get(streamId)!;
-          channel.onopen = null;
-          channel.onerror = null;
-          channel.onclose = null;
-          channel.onmessage = null;
-          channel.close();
+          channel.channel.onopen = null;
+          channel.channel.onerror = null;
+          channel.channel.onclose = null;
+          channel.channel.onbufferedamountlow = null;
+          channel.channel.onmessage = null;
+          channel.channel.close();
           dataChannels.delete(streamId);
         }
       },
 
       send: (data: Uint8Array, streamId: number): void => {
-        dataChannels.get(streamId)!.send(data);
+        const channel = dataChannels.get(streamId)!;
+        channel.channel.send(data);
+        channel.bufferedBytes += data.length;
       },
+
+      closeSend: (): void => { throw new Error('Wrong connection type') },
 
       openOutSubstream: () => {
         // `openOutSubstream` can only be called after we have called `config.onOpen`, therefore
@@ -476,8 +524,8 @@ export function start(options?: ClientOptions): Client {
             // We need to check again if `handshakeDataChannel` is still defined, as the
             // connection might have been closed.
             if (handshakeDataChannel) {
-              config.onStreamOpened(handshakeDataChannel.id!, 'outbound')
-              dataChannels.set(handshakeDataChannel.id!, handshakeDataChannel)
+              config.onStreamOpened(handshakeDataChannel.id!, 'outbound', 1024 * 1024)
+              dataChannels.set(handshakeDataChannel.id!, { channel: handshakeDataChannel, bufferedBytes: 0 })
               handshakeDataChannel = undefined
             }
           })()
