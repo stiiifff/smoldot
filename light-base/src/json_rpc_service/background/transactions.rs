@@ -17,15 +17,16 @@
 
 //! All JSON-RPC method handlers that relate to transactions.
 
-use super::{Background, Platform, SubscriptionMessage};
+use super::{Background, PlatformRef, SubscriptionMessage};
 
 use crate::transactions_service;
 
 use alloc::{borrow::ToOwned as _, str, string::ToString as _, sync::Arc, vec::Vec};
-use futures::prelude::*;
+use core::pin;
+use futures_util::{future, StreamExt as _};
 use smoldot::json_rpc::{self, methods, requests_subscriptions};
 
-impl<TPlat: Platform> Background<TPlat> {
+impl<TPlat: PlatformRef> Background<TPlat> {
     /// Handles a call to [`methods::MethodCall::author_pendingExtrinsics`].
     pub(super) async fn author_pending_extrinsics(
         self: &Arc<Self>,
@@ -150,11 +151,11 @@ impl<TPlat: Platform> Background<TPlat> {
                 .transactions_service
                 .submit_and_watch_transaction(transaction.0, 16)
                 .await;
-            let me = self.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
 
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         if is_legacy {
@@ -176,15 +177,27 @@ impl<TPlat: Platform> Background<TPlat> {
 
                 // TODO: doesn't reported `validated` events
 
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
+
                 loop {
-                    let status_update = match {
-                        let next_message = messages_rx.next();
-                        futures::pin_mut!(next_message);
+                    let event = {
+                        let next_message = pin::pin!(messages_rx.next());
                         match future::select(transaction_updates.next(), next_message).await {
                             future::Either::Left((v, _)) => either::Left(v),
                             future::Either::Right((v, _)) => either::Right(v),
                         }
-                    } {
+                    };
+
+                    let requests_subscriptions = match requests_subscriptions.upgrade() {
+                        Some(rs) => rs,
+                        None => return,
+                    };
+
+                    let status_update = match event {
                         either::Left(Some(status)) => status,
                         either::Left(None) if !is_legacy => {
                             // Channel from the transactions service has been closed.
@@ -198,8 +211,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             // client understands that no new notification is expected and
                             // unsubscribes.
                             break loop {
-                                let next_message = messages_rx.next();
-                                futures::pin_mut!(next_message);
+                                let next_message = pin::pin!(messages_rx.next());
                                 if let (
                                     SubscriptionMessage::StopIfTransactionLegacy {
                                         stop_request_id,
@@ -207,7 +219,7 @@ impl<TPlat: Platform> Background<TPlat> {
                                     confirmation_sender,
                                 ) = next_message.await
                                 {
-                                    me.requests_subscriptions
+                                    requests_subscriptions
                                         .respond(
                                             &stop_request_id.1,
                                             methods::Response::author_unwatchExtrinsic(true)
@@ -224,7 +236,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             SubscriptionMessage::StopIfTransaction { stop_request_id },
                             confirmation_sender,
                         )) if !is_legacy => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::transaction_unstable_unwatch(())
@@ -239,7 +251,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             SubscriptionMessage::StopIfTransactionLegacy { stop_request_id },
                             confirmation_sender,
                         )) if is_legacy => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::author_unwatchExtrinsic(true)
@@ -451,8 +463,7 @@ impl<TPlat: Platform> Background<TPlat> {
                     };
 
                     // TODO: handle situation where buffer is full
-                    let _ = me
-                        .requests_subscriptions
+                    let _ = requests_subscriptions
                         .try_push_notification(&request_id.1, &subscription_id, update)
                         .await;
                 }

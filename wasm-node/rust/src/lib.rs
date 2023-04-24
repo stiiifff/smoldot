@@ -22,13 +22,14 @@
 
 use core::{
     cmp::Ordering,
+    num::NonZeroU32,
     ops::{Add, Sub},
     pin::Pin,
-    slice, str,
+    str,
     sync::atomic,
     time::Duration,
 };
-use futures::prelude::*;
+use futures_util::{stream, FutureExt as _, Stream as _, StreamExt as _};
 use smoldot_light::HandleRpcError;
 use std::{
     sync::{Arc, Mutex},
@@ -154,13 +155,10 @@ fn start_shutdown() {
 }
 
 fn add_chain(
-    chain_spec_pointer: u32,
-    chain_spec_len: u32,
-    database_content_pointer: u32,
-    database_content_len: u32,
+    chain_spec: Vec<u8>,
+    database_content: Vec<u8>,
     json_rpc_running: u32,
-    potential_relay_chains_ptr: u32,
-    potential_relay_chains_len: u32,
+    potential_relay_chains: Vec<u8>,
 ) -> u32 {
     let mut client_lock = CLIENT.lock().unwrap();
 
@@ -182,43 +180,10 @@ fn add_chain(
         return u32::try_from(chain_id).unwrap();
     }
 
-    // Retrieve the chain spec parameter passed through the FFI layer.
-    let chain_spec: Box<[u8]> = {
-        let chain_spec_pointer = usize::try_from(chain_spec_pointer).unwrap();
-        let chain_spec_len = usize::try_from(chain_spec_len).unwrap();
-        unsafe {
-            Box::from_raw(slice::from_raw_parts_mut(
-                chain_spec_pointer as *mut u8,
-                chain_spec_len,
-            ))
-        }
-    };
-
-    // Retrieve the database content parameter passed through the FFI layer.
-    let database_content: Box<[u8]> = {
-        let database_content_pointer = usize::try_from(database_content_pointer).unwrap();
-        let database_content_len = usize::try_from(database_content_len).unwrap();
-        unsafe {
-            Box::from_raw(slice::from_raw_parts_mut(
-                database_content_pointer as *mut u8,
-                database_content_len,
-            ))
-        }
-    };
-
     // Retrieve the potential relay chains parameter passed through the FFI layer.
     let potential_relay_chains: Vec<_> = {
-        let allowed_relay_chains_ptr = usize::try_from(potential_relay_chains_ptr).unwrap();
-        let allowed_relay_chains_len = usize::try_from(potential_relay_chains_len).unwrap();
-
-        let raw_data = unsafe {
-            Box::from_raw(slice::from_raw_parts_mut(
-                allowed_relay_chains_ptr as *mut u8,
-                allowed_relay_chains_len * 4,
-            ))
-        };
-
-        raw_data
+        assert_eq!(potential_relay_chains.len() % 4, 0);
+        potential_relay_chains
             .chunks(4)
             .map(|c| u32::from_le_bytes(<[u8; 4]>::try_from(c).unwrap()))
             .filter_map(|c| {
@@ -248,9 +213,19 @@ fn add_chain(
         .smoldot
         .add_chain(smoldot_light::AddChainConfig {
             user_data: (),
-            specification: str::from_utf8(&chain_spec).unwrap(),
-            database_content: str::from_utf8(&database_content).unwrap(),
-            disable_json_rpc: json_rpc_running == 0,
+            specification: str::from_utf8(&chain_spec)
+                .unwrap_or_else(|_| panic!("non-utf8 chain spec")),
+            database_content: str::from_utf8(&database_content)
+                .unwrap_or_else(|_| panic!("non-utf8 database content")),
+            json_rpc: if json_rpc_running == 0 {
+                smoldot_light::AddChainConfigJsonRpc::Disabled
+            } else {
+                smoldot_light::AddChainConfigJsonRpc::Enabled {
+                    max_pending_requests: NonZeroU32::new(128).unwrap(),
+                    // Note: the PolkadotJS UI is very heavy in terms of subscriptions.
+                    max_subscriptions: 1024,
+                }
+            },
             potential_relay_chains: potential_relay_chains.into_iter(),
         }) {
         Ok(c) => c,
@@ -341,7 +316,7 @@ fn remove_chain(chain_id: u32) {
             // purpose of erasing the previously-registered waker.
             if let Some(mut json_rpc_responses_rx) = json_rpc_responses_rx {
                 let _ = Pin::new(&mut json_rpc_responses_rx).poll_next(
-                    &mut task::Context::from_waker(futures::task::noop_waker_ref()),
+                    &mut task::Context::from_waker(futures_util::task::noop_waker_ref()),
                 );
             }
 
@@ -402,15 +377,10 @@ fn chain_error_ptr(chain_id: u32) -> u32 {
     }
 }
 
-fn json_rpc_send(ptr: u32, len: u32, chain_id: u32) -> u32 {
-    let json_rpc_request: Box<[u8]> = {
-        let ptr = usize::try_from(ptr).unwrap();
-        let len = usize::try_from(len).unwrap();
-        unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr as *mut u8, len)) }
-    };
-
+fn json_rpc_send(json_rpc_request: Vec<u8>, chain_id: u32) -> u32 {
     // As mentioned in the documentation, the bytes *must* be valid UTF-8.
-    let json_rpc_request: String = String::from_utf8(json_rpc_request.into()).unwrap();
+    let json_rpc_request: String = String::from_utf8(json_rpc_request.into())
+        .unwrap_or_else(|_| panic!("non-UTF-8 JSON-RPC request"));
 
     let mut client_lock = CLIENT.lock().unwrap();
     let client_chain_id = match client_lock

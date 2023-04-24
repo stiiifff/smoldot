@@ -27,6 +27,13 @@ export interface Config {
     instance?: SmoldotWasmInstance,
 
     /**
+     * Array used to store the buffers provided to the Rust code.
+     *
+     * When `buffer_size` or `buffer_index` are called, the buffer is found here.
+     */
+    bufferIndices: Array<Uint8Array>,
+
+    /**
      * Returns the number of milliseconds since an arbitrary epoch.
      */
     performanceNow: () => number,
@@ -95,7 +102,7 @@ export interface Config {
      *
      * The connection and stream must currently be in the `Open` state.
      *
-     * The number of bytes most never exceed the number of "writable bytes" of the stream.
+     * The number of bytes must never exceed the number of "writable bytes" of the stream.
      * `onWritableBytes` can be used in order to notify that more writable bytes are available.
      *
      * The `streamId` must be provided if and only if the connection is of type "multi-stream".
@@ -190,7 +197,8 @@ export interface ConnectionConfig {
     onStreamReset: (streamId: number) => void;
 
     /**
-     * Callback called when more data can be written on the stream.
+     * Callback called when some data sent using {@link Connection.send} has effectively been
+     * written on the stream, meaning that some buffer space is now free.
      *
      * Can only happen while the connection is in the `Open` state.
      *
@@ -198,6 +206,9 @@ export interface ConnectionConfig {
      *
      * The `streamId` parameter must be provided if and only if the connection is of type
      * "multi-stream".
+     *
+     * Only a number of bytes equal to the size of the data provided to {@link Connection.send}
+     * must be reported. In other words, the `initialWritableBytes` must never be exceeded.
      */
     onWritableBytes: (numExtra: number, streamId?: number) => void;
 
@@ -252,6 +263,19 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
 
             const message = buffer.utf8BytesToString(new Uint8Array(instance.exports.memory.buffer), ptr, len);
             config.onPanic(message);
+        },
+
+        buffer_size: (bufferIndex: number) => {
+            const buf = config.bufferIndices[bufferIndex]!;
+            return buf.byteLength;
+        },
+
+        buffer_copy: (bufferIndex: number, targetPtr: number) => {
+            const instance = config.instance!;
+            targetPtr = targetPtr >>> 0;
+
+            const buf = config.bufferIndices[bufferIndex]!;
+            new Uint8Array(instance.exports.memory.buffer).set(buf, targetPtr);
         },
 
         // Used by the Rust side to notify that a JSON-RPC response or subscription notification
@@ -322,12 +346,12 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
 
         // Must create a new connection object. This implementation stores the created object in
         // `connections`.
-        connection_new: (connectionId: number, addrPtr: number, addrLen: number, errorPtrPtr: number) => {
+        connection_new: (connectionId: number, addrPtr: number, addrLen: number, errorBufferIndexPtr: number) => {
             const instance = config.instance!;
 
             addrPtr >>>= 0;
             addrLen >>>= 0;
-            errorPtrPtr >>>= 0;
+            errorBufferIndexPtr >>>= 0;
 
             if (!!connections[connectionId]) {
                 throw new Error("internal error: connection already allocated");
@@ -350,13 +374,13 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
                                     break
                                 }
                                 case 'multi-stream': {
-                                    const bufferLen = 1 + info.localTlsCertificateMultihash.length + info.remoteTlsCertificateMultihash.length;
-                                    const ptr = instance.exports.alloc(bufferLen) >>> 0;
-                                    const mem = new Uint8Array(instance.exports.memory.buffer);
-                                    buffer.writeUInt8(mem, ptr, 0);
-                                    mem.set(info.localTlsCertificateMultihash, ptr + 1)
-                                    mem.set(info.remoteTlsCertificateMultihash, ptr + 1 + info.localTlsCertificateMultihash.length)
-                                    instance.exports.connection_open_multi_stream(connectionId, ptr, bufferLen);
+                                    const handshakeTy = new Uint8Array(1 + info.localTlsCertificateMultihash.length + info.remoteTlsCertificateMultihash.length);
+                                    buffer.writeUInt8(handshakeTy, 0, 0);
+                                    handshakeTy.set(info.localTlsCertificateMultihash, 1)
+                                    handshakeTy.set(info.remoteTlsCertificateMultihash, 1 + info.localTlsCertificateMultihash.length)
+                                    config.bufferIndices[0] = handshakeTy;
+                                    instance.exports.connection_open_multi_stream(connectionId, 0);
+                                    delete config.bufferIndices[0]
                                     break
                                 }
                             }
@@ -365,10 +389,9 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
                     onConnectionReset: (message: string) => {
                         if (killedTracked.killed) return;
                         try {
-                            const encoded = new TextEncoder().encode(message)
-                            const ptr = instance.exports.alloc(encoded.length) >>> 0;
-                            new Uint8Array(instance.exports.memory.buffer).set(encoded, ptr);
-                            instance.exports.connection_reset(connectionId, ptr, encoded.length);
+                            config.bufferIndices[0] = new TextEncoder().encode(message);
+                            instance.exports.connection_reset(connectionId, 0);
+                            delete config.bufferIndices[0]
                         } catch(_error) {}
                     },
                     onWritableBytes: (numExtra, streamId) => {
@@ -384,9 +407,9 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
                     onMessage: (message: Uint8Array, streamId?: number) => {
                         if (killedTracked.killed) return;
                         try {
-                            const ptr = instance.exports.alloc(message.length) >>> 0;
-                            new Uint8Array(instance.exports.memory.buffer).set(message, ptr)
-                            instance.exports.stream_message(connectionId, streamId || 0, ptr, message.length);
+                            config.bufferIndices[0] = message;
+                            instance.exports.stream_message(connectionId, streamId || 0, 0);
+                            delete config.bufferIndices[0]
                         } catch(_error) {}
                     },
                     onStreamOpened: (streamId: number, direction: 'inbound' | 'outbound', initialWritableBytes) => {
@@ -418,13 +441,11 @@ export default function (config: Config): { imports: WebAssembly.ModuleImports, 
                 if (error instanceof Error) {
                     errorStr = error.toString();
                 }
+
                 const mem = new Uint8Array(instance.exports.memory.buffer);
-                const encoded = new TextEncoder().encode(errorStr)
-                const ptr = instance.exports.alloc(encoded.length) >>> 0;
-                mem.set(encoded, ptr);
-                buffer.writeUInt32LE(mem, errorPtrPtr, ptr);
-                buffer.writeUInt32LE(mem, errorPtrPtr + 4, encoded.length);
-                buffer.writeUInt8(mem, errorPtrPtr + 8, isBadAddress ? 1 : 0);
+                config.bufferIndices[0] = new TextEncoder().encode(errorStr)
+                buffer.writeUInt32LE(mem, errorBufferIndexPtr, 0);
+                buffer.writeUInt8(mem, errorBufferIndexPtr + 4, isBadAddress ? 1 : 0);
                 return 1;
             }
         },

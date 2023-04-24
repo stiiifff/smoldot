@@ -17,7 +17,7 @@
 
 //! All legacy JSON-RPC method handlers that relate to the chain or the storage.
 
-use super::{Background, Platform, SubscriptionMessage};
+use super::{Background, PlatformRef, SubscriptionMessage};
 
 use crate::runtime_service;
 
@@ -29,12 +29,14 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use async_lock::MutexGuard;
 use core::{
     iter,
     num::{NonZeroU32, NonZeroUsize},
+    pin,
     time::Duration,
 };
-use futures::{lock::MutexGuard, prelude::*};
+use futures_util::{future, stream, FutureExt as _, StreamExt as _};
 use smoldot::{
     header,
     informant::HashDisplay,
@@ -44,7 +46,7 @@ use smoldot::{
 
 mod sub_utils;
 
-impl<TPlat: Platform> Background<TPlat> {
+impl<TPlat: PlatformRef> Background<TPlat> {
     /// Handles a call to [`methods::MethodCall::system_accountNextIndex`].
     pub(super) async fn account_next_index(
         self: &Arc<Self>,
@@ -385,17 +387,26 @@ impl<TPlat: Platform> Background<TPlat> {
         };
 
         subscription_start.start({
-            let me = self.clone();
+            let log_target = self.log_target.clone();
+            let sync_service = self.sync_service.clone();
+            let runtime_service = self.runtime_service.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
 
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         methods::Response::chain_subscribeAllHeads((&subscription_id).into())
                             .to_json_response(&request_id.0),
                     )
                     .await;
+
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
 
                 'main_sub_loop: loop {
                     let mut new_blocks = {
@@ -404,8 +415,7 @@ impl<TPlat: Platform> Background<TPlat> {
                         // The maximum number of pinned block is ignored, as this maximum is a way
                         // to avoid malicious behaviors. This code is by definition not considered
                         // malicious.
-                        let subscribe_all = me
-                            .runtime_service
+                        let subscribe_all = runtime_service
                             .subscribe_all(
                                 "chain_subscribeAllHeads",
                                 64,
@@ -435,13 +445,17 @@ impl<TPlat: Platform> Background<TPlat> {
 
                     loop {
                         let message = {
-                            let next_new_block = new_blocks.next();
-                            let next_message = messages_rx.next();
-                            futures::pin_mut!(next_message, next_new_block);
+                            let next_new_block = pin::pin!(new_blocks.next());
+                            let next_message = pin::pin!(messages_rx.next());
                             match future::select(next_new_block, next_message).await {
                                 future::Either::Left((v, _)) => either::Left(v),
                                 future::Either::Right((v, _)) => either::Right(v),
                             }
+                        };
+
+                        let requests_subscriptions = match requests_subscriptions.upgrade() {
+                            Some(rs) => rs,
+                            None => return,
                         };
 
                         match message {
@@ -458,15 +472,17 @@ impl<TPlat: Platform> Background<TPlat> {
 
                                 let header = match methods::Header::from_scale_encoded_header(
                                     &block.scale_encoded_header,
-                                    me.sync_service.block_number_bytes(),
+                                    sync_service.block_number_bytes(),
                                 ) {
                                     Ok(h) => h,
                                     Err(error) => {
                                         log::warn!(
-                                            target: &me.log_target,
+                                            target: &log_target,
                                             "`chain_subscribeAllHeads` subscription has skipped \
                                             block due to undecodable header. Hash: {}. Error: {}",
-                                            HashDisplay(&header::hash_from_scale_encoded_header(&block.scale_encoded_header)),
+                                            HashDisplay(&header::hash_from_scale_encoded_header(
+                                                &block.scale_encoded_header
+                                            )),
                                             error,
                                         );
                                         continue;
@@ -478,8 +494,7 @@ impl<TPlat: Platform> Background<TPlat> {
                                 // unfortunately doesn't provide any mechanism to deal with this
                                 // situation, and we handle it by simply not sending the
                                 // notification.
-                                let _ = me
-                                    .requests_subscriptions
+                                let _ = requests_subscriptions
                                     .try_push_notification(
                                         &request_id.1,
                                         &subscription_id,
@@ -498,12 +513,10 @@ impl<TPlat: Platform> Background<TPlat> {
                                 ..
                             })) => {}
                             either::Right((
-                                SubscriptionMessage::StopIfAllHeads {
-                                    stop_request_id,
-                                },
+                                SubscriptionMessage::StopIfAllHeads { stop_request_id },
                                 confirmation_sender,
                             )) => {
-                                me.requests_subscriptions
+                                requests_subscriptions
                                     .respond(
                                         &stop_request_id.1,
                                         methods::Response::chain_unsubscribeAllHeads(true)
@@ -561,11 +574,13 @@ impl<TPlat: Platform> Background<TPlat> {
         };
 
         subscription_start.start({
-            let me = self.clone();
+            let log_target = self.log_target.clone();
+            let sync_service = self.sync_service.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
 
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         methods::Response::chain_subscribeFinalizedHeads((&subscription_id).into())
@@ -573,33 +588,52 @@ impl<TPlat: Platform> Background<TPlat> {
                     )
                     .await;
 
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
+
                 loop {
-                    let next_message = messages_rx.next();
-                    futures::pin_mut!(next_message);
-                    match future::select(blocks_list.next(), next_message).await {
-                        future::Either::Left((None, _)) => {
+                    let event = {
+                        let next_message = pin::pin!(messages_rx.next());
+                        match future::select(blocks_list.next(), next_message).await {
+                            future::Either::Left((ev, _)) => either::Left(ev),
+                            future::Either::Right((ev, _)) => either::Right(ev),
+                        }
+                    };
+
+                    let requests_subscriptions = match requests_subscriptions.upgrade() {
+                        Some(rs) => rs,
+                        None => return,
+                    };
+
+                    match event {
+                        either::Left(None) => {
                             // Stream returned by `subscribe_finalized` is always unlimited.
                             unreachable!()
                         }
-                        future::Either::Left((Some(header), _)) => {
+                        either::Left(Some(header)) => {
                             let header = match methods::Header::from_scale_encoded_header(
                                 &header,
-                                me.sync_service.block_number_bytes(),
+                                sync_service.block_number_bytes(),
                             ) {
                                 Ok(h) => h,
                                 Err(error) => {
                                     log::warn!(
-                                        target: &me.log_target,
+                                        target: &log_target,
                                         "`chain_subscribeFinalizedHeads` subscription has skipped \
                                         block due to undecodable header. Hash: {}. Error: {}",
-                                        HashDisplay(&header::hash_from_scale_encoded_header(&header)),
+                                        HashDisplay(&header::hash_from_scale_encoded_header(
+                                            &header
+                                        )),
                                         error,
                                     );
                                     continue;
                                 }
                             };
 
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .set_queued_notification(
                                     &request_id.1,
                                     &subscription_id,
@@ -612,16 +646,11 @@ impl<TPlat: Platform> Background<TPlat> {
                                 )
                                 .await;
                         }
-                        future::Either::Right((
-                            (
-                                SubscriptionMessage::StopIfFinalizedHeads {
-                                    stop_request_id,
-                                },
-                                confirmation_sender,
-                            ),
-                            _,
+                        either::Right((
+                            SubscriptionMessage::StopIfFinalizedHeads { stop_request_id },
+                            confirmation_sender,
                         )) => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::chain_unsubscribeFinalizedHeads(true)
@@ -632,7 +661,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             confirmation_sender.send();
                             break;
                         }
-                        future::Either::Right((_, _)) => {
+                        either::Right(_) => {
                             // Any other message.
                             // Silently discard the confirmation sender.
                         }
@@ -678,11 +707,13 @@ impl<TPlat: Platform> Background<TPlat> {
         };
 
         subscription_start.start({
-            let me = self.clone();
+            let log_target = self.log_target.clone();
+            let sync_service = self.sync_service.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
 
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         methods::Response::chain_subscribeNewHeads((&subscription_id).into())
@@ -690,33 +721,52 @@ impl<TPlat: Platform> Background<TPlat> {
                     )
                     .await;
 
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
+
                 loop {
-                    let next_message = messages_rx.next();
-                    futures::pin_mut!(next_message);
-                    match future::select(blocks_list.next(), next_message).await {
-                        future::Either::Left((None, _)) => {
+                    let event = {
+                        let next_message = pin::pin!(messages_rx.next());
+                        match future::select(blocks_list.next(), next_message).await {
+                            future::Either::Left((ev, _)) => either::Left(ev),
+                            future::Either::Right((ev, _)) => either::Right(ev),
+                        }
+                    };
+
+                    let requests_subscriptions = match requests_subscriptions.upgrade() {
+                        Some(rs) => rs,
+                        None => return,
+                    };
+
+                    match event {
+                        either::Left(None) => {
                             // Stream returned by `subscribe_best` is always unlimited.
                             unreachable!()
                         }
-                        future::Either::Left((Some(header), _)) => {
+                        either::Left(Some(header)) => {
                             let header = match methods::Header::from_scale_encoded_header(
                                 &header,
-                                me.sync_service.block_number_bytes(),
+                                sync_service.block_number_bytes(),
                             ) {
                                 Ok(h) => h,
                                 Err(error) => {
                                     log::warn!(
-                                        target: &me.log_target,
+                                        target: &log_target,
                                         "`chain_subscribeNewHeads` subscription has skipped block \
                                         due to undecodable header. Hash: {}. Error: {}",
-                                        HashDisplay(&header::hash_from_scale_encoded_header(&header)),
+                                        HashDisplay(&header::hash_from_scale_encoded_header(
+                                            &header
+                                        )),
                                         error,
                                     );
                                     continue;
                                 }
                             };
 
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .set_queued_notification(
                                     &request_id.1,
                                     &subscription_id,
@@ -729,16 +779,11 @@ impl<TPlat: Platform> Background<TPlat> {
                                 )
                                 .await;
                         }
-                        future::Either::Right((
-                            (
-                                SubscriptionMessage::StopIfNewHeads {
-                                    stop_request_id,
-                                },
-                                confirmation_sender,
-                            ),
-                            _,
+                        either::Right((
+                            SubscriptionMessage::StopIfNewHeads { stop_request_id },
+                            confirmation_sender,
                         )) => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::chain_unsubscribeNewHeads(true)
@@ -749,7 +794,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             confirmation_sender.send();
                             break;
                         }
-                        future::Either::Right((_, _)) => {
+                        either::Right(_) => {
                             // Any other message.
                             // Silently discard the confirmation sender.
                         }
@@ -1377,10 +1422,11 @@ impl<TPlat: Platform> Background<TPlat> {
         };
 
         subscription_start.start({
-            let me = self.clone();
+            let runtime_service = self.runtime_service.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         methods::Response::state_subscribeRuntimeVersion((&subscription_id).into())
@@ -1389,19 +1435,36 @@ impl<TPlat: Platform> Background<TPlat> {
                     .await;
 
                 let (current_spec, spec_changes) =
-                    sub_utils::subscribe_runtime_version(&me.runtime_service).await;
-                let spec_changes = stream::iter(iter::once(current_spec)).chain(spec_changes);
-                futures::pin_mut!(spec_changes);
+                    sub_utils::subscribe_runtime_version(&runtime_service).await;
+                let mut spec_changes =
+                    pin::pin!(stream::iter(iter::once(current_spec)).chain(spec_changes));
+
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
 
                 loop {
-                    let next_message = messages_rx.next();
-                    futures::pin_mut!(next_message);
-                    match future::select(spec_changes.next(), next_message).await {
-                        future::Either::Left((None, _)) => {
+                    let event = {
+                        let next_message = pin::pin!(messages_rx.next());
+                        match future::select(spec_changes.next(), next_message).await {
+                            future::Either::Left((ev, _)) => either::Left(ev),
+                            future::Either::Right((ev, _)) => either::Right(ev),
+                        }
+                    };
+
+                    let requests_subscriptions = match requests_subscriptions.upgrade() {
+                        Some(rs) => rs,
+                        None => return,
+                    };
+
+                    match event {
+                        either::Left(None) => {
                             // Stream returned by `subscribe_runtime_version` is always unlimited.
                             unreachable!()
                         }
-                        future::Either::Left((Some(new_runtime), _)) => {
+                        either::Left(Some(new_runtime)) => {
                             let notification_body = if let Ok(runtime_spec) = new_runtime {
                                 let runtime_spec = runtime_spec.decode();
                                 methods::ServerToClient::state_runtimeVersion {
@@ -1441,7 +1504,7 @@ impl<TPlat: Platform> Background<TPlat> {
                                 .to_json_call_object_parameters(None)
                             };
 
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .set_queued_notification(
                                     &request_id.1,
                                     &subscription_id,
@@ -1450,14 +1513,11 @@ impl<TPlat: Platform> Background<TPlat> {
                                 )
                                 .await;
                         }
-                        future::Either::Right((
-                            (
-                                SubscriptionMessage::StopIfRuntimeSpec { stop_request_id },
-                                confirmation_sender,
-                            ),
-                            _,
+                        either::Right((
+                            SubscriptionMessage::StopIfRuntimeSpec { stop_request_id },
+                            confirmation_sender,
                         )) => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::state_unsubscribeRuntimeVersion(true)
@@ -1468,7 +1528,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             confirmation_sender.send();
                             break;
                         }
-                        future::Either::Right((_, _)) => {
+                        either::Right(_) => {
                             // Any other message.
                             // Silently discard the confirmation sender.
                         }
@@ -1627,11 +1687,11 @@ impl<TPlat: Platform> Background<TPlat> {
         };
 
         subscription_start.start({
-            let me = self.clone();
+            let requests_subscriptions = self.requests_subscriptions.clone();
             let request_id = (request_id.0.to_owned(), request_id.1.clone());
 
             async move {
-                me.requests_subscriptions
+                requests_subscriptions
                     .respond(
                         &request_id.1,
                         methods::Response::state_subscribeStorage((&subscription_id).into())
@@ -1639,18 +1699,35 @@ impl<TPlat: Platform> Background<TPlat> {
                     )
                     .await;
 
-                futures::pin_mut!(storage_updates);
+                let mut storage_updates = pin::pin!(storage_updates);
+
+                let requests_subscriptions = {
+                    let weak = Arc::downgrade(&requests_subscriptions);
+                    drop(requests_subscriptions);
+                    weak
+                };
 
                 loop {
-                    let next_message = messages_rx.next();
-                    futures::pin_mut!(next_message);
-                    match future::select(storage_updates.next(), next_message).await {
-                        future::Either::Left((None, _)) => {
+                    let event = {
+                        let next_message = pin::pin!(messages_rx.next());
+                        match future::select(storage_updates.next(), next_message).await {
+                            future::Either::Left((ev, _)) => either::Left(ev),
+                            future::Either::Right((ev, _)) => either::Right(ev),
+                        }
+                    };
+
+                    let requests_subscriptions = match requests_subscriptions.upgrade() {
+                        Some(rs) => rs,
+                        None => return,
+                    };
+
+                    match event {
+                        either::Left(None) => {
                             // Stream created above is always unlimited.
                             unreachable!()
                         }
-                        future::Either::Left((Some(changes), _)) => {
-                            me.requests_subscriptions
+                        either::Left(Some(changes)) => {
+                            requests_subscriptions
                                 .set_queued_notification(
                                     &request_id.1,
                                     &subscription_id,
@@ -1663,14 +1740,11 @@ impl<TPlat: Platform> Background<TPlat> {
                                 )
                                 .await;
                         }
-                        future::Either::Right((
-                            (
-                                SubscriptionMessage::StopIfStorage { stop_request_id },
-                                confirmation_sender,
-                            ),
-                            _,
+                        either::Right((
+                            SubscriptionMessage::StopIfStorage { stop_request_id },
+                            confirmation_sender,
                         )) => {
-                            me.requests_subscriptions
+                            requests_subscriptions
                                 .respond(
                                     &stop_request_id.1,
                                     methods::Response::state_unsubscribeStorage(true)
@@ -1681,7 +1755,7 @@ impl<TPlat: Platform> Background<TPlat> {
                             confirmation_sender.send();
                             break;
                         }
-                        future::Either::Right((_, _)) => {
+                        either::Right(_) => {
                             // Any other message.
                             // Silently discard the confirmation sender.
                         }
